@@ -661,6 +661,7 @@
                                                                 {/if}
                                                             </div>
                                                             <div class="local-split-subtitle">{splitItem.rel_path}</div>
+                                                            <div class="local-meta">{formatDuration(splitItem.duration || 0)}</div>
                                                         </div>
                                                         <button
                                                                 class="btn btn-cancel btn-sm"
