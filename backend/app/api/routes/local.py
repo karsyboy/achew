@@ -1,7 +1,7 @@
 import logging
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from ...core.config import get_app_config, get_effective_local_root, get_local_completion_config, get_settings
 from ...models.local import LocalLibraryItem
@@ -50,7 +50,7 @@ def _apply_completion_flags(items: List[LocalLibraryItem]) -> List[LocalLibraryI
 
 
 @router.get("/items", response_model=List[LocalLibraryItem])
-async def list_local_items():
+async def list_local_items(refresh: bool = Query(False, description="Force a full local library rescan")):
     """List discoverable audiobook candidates under the configured local root."""
     settings = get_settings()
     effective_root = get_effective_local_root()
@@ -66,7 +66,7 @@ async def list_local_items():
 
     try:
         service = LocalLibraryService(effective_root, settings.LOCAL_MEDIA_BASE)
-        return _apply_completion_flags(service.scan_items())
+        return _apply_completion_flags(service.get_cached_items(refresh=refresh))
     except Exception as e:
         logger.error(f"Failed to scan local items: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to scan local library: {e}")

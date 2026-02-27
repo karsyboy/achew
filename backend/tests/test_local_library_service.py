@@ -1,11 +1,35 @@
 from pathlib import Path
 
+from app.models.local import LocalAudioFileInfo, LocalLibraryItem
 from app.services.local_library_service import LocalLibraryService, validate_local_root
 
 
 def _touch(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"audio")
+
+
+def _make_library_item(rel_path: str) -> LocalLibraryItem:
+    filename = Path(rel_path).name
+    return LocalLibraryItem(
+        id=LocalLibraryService.build_item_id("file", rel_path),
+        name=Path(rel_path).stem,
+        rel_path=rel_path,
+        candidate_type="single_file_book",
+        processing_mode="single_file",
+        file_count=1,
+        duration=123.0,
+        files=[
+            LocalAudioFileInfo(
+                rel_path=rel_path,
+                filename=filename,
+                duration=123.0,
+                size=456,
+            )
+        ],
+        can_split=False,
+        individual_items=[],
+    )
 
 
 def test_validate_local_root_accepts_path_within_media_base(tmp_path):
@@ -95,6 +119,56 @@ def test_resolve_candidate_respects_individual_layout_hint(tmp_path, monkeypatch
     assert resolved.media_layout == "multi_file_individual"
     assert resolved.rel_paths == ["Book C/01.m4a"]
     assert resolved.total_duration == 123.0
+
+
+def test_get_cached_items_scans_once_until_refresh(tmp_path, monkeypatch):
+    media_base = tmp_path / "media"
+    root = media_base / "library"
+    root.mkdir(parents=True)
+
+    LocalLibraryService.clear_scan_cache()
+    calls = {"count": 0}
+
+    def fake_scan_items(self):
+        calls["count"] += 1
+        return [_make_library_item(f"Book {calls['count']}.m4b")]
+
+    monkeypatch.setattr(LocalLibraryService, "scan_items", fake_scan_items)
+
+    service = LocalLibraryService(str(root), str(media_base))
+
+    first = service.get_cached_items()
+    second = service.get_cached_items()
+    refreshed = service.get_cached_items(refresh=True)
+
+    assert calls["count"] == 2
+    assert [item.rel_path for item in first] == ["Book 1.m4b"]
+    assert [item.rel_path for item in second] == ["Book 1.m4b"]
+    assert [item.rel_path for item in refreshed] == ["Book 2.m4b"]
+
+    LocalLibraryService.clear_scan_cache()
+
+
+def test_get_cached_items_returns_deep_copies(tmp_path, monkeypatch):
+    media_base = tmp_path / "media"
+    root = media_base / "library"
+    root.mkdir(parents=True)
+
+    LocalLibraryService.clear_scan_cache()
+    monkeypatch.setattr(LocalLibraryService, "scan_items", lambda self: [_make_library_item("Book A.m4b")])
+
+    service = LocalLibraryService(str(root), str(media_base))
+
+    first = service.get_cached_items()
+    first[0].completed = True
+    first[0].files[0].filename = "mutated.m4b"
+
+    second = service.get_cached_items()
+
+    assert second[0].completed is False
+    assert second[0].files[0].filename == "Book A.m4b"
+
+    LocalLibraryService.clear_scan_cache()
 
 
 def test_validate_audio_file_accepts_audio_stream_and_duration(tmp_path, monkeypatch):

@@ -4,9 +4,10 @@ import logging
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Literal
+from typing import Dict, List, Optional, Tuple, Literal
 
 from ..core.config import get_settings
 from ..models.local import LocalLibraryItem, LocalAudioFileInfo, LocalSplitItem
@@ -28,6 +29,15 @@ class LocalResolvedItem:
     rel_paths: List[str]
     durations: List[float]
     total_duration: float
+
+
+@dataclass
+class LocalLibraryCacheEntry:
+    items: List[LocalLibraryItem]
+    timestamp: datetime
+
+
+_local_library_cache: Dict[str, LocalLibraryCacheEntry] = {}
 
 
 def natural_sort_key(value: str):
@@ -95,6 +105,31 @@ class LocalLibraryService:
         effective_root = get_effective_local_root()
         root_path = effective_root or settings.LOCAL_MEDIA_BASE
         return cls(root_path, settings.LOCAL_MEDIA_BASE)
+
+    @staticmethod
+    def _clone_items(items: List[LocalLibraryItem]) -> List[LocalLibraryItem]:
+        return [item.model_copy(deep=True) for item in items]
+
+    @classmethod
+    def clear_scan_cache(cls) -> None:
+        _local_library_cache.clear()
+
+    def get_cached_items(self, refresh: bool = False) -> List[LocalLibraryItem]:
+        cache_key = str(self.root)
+
+        if not refresh:
+            cache_entry = _local_library_cache.get(cache_key)
+            if cache_entry:
+                logger.info(f"Using cached local library scan for {cache_key}")
+                return self._clone_items(cache_entry.items)
+
+        items = self.scan_items()
+        _local_library_cache[cache_key] = LocalLibraryCacheEntry(
+            items=self._clone_items(items),
+            timestamp=datetime.now(timezone.utc),
+        )
+        logger.info(f"Scanned and cached {len(items)} local library items for {cache_key}")
+        return items
 
     @staticmethod
     def build_item_id(kind: Literal["file", "folder"], rel_path: str) -> str:

@@ -532,8 +532,16 @@ export const audiobookshelf = {
 
 // Local source API
 export const local = {
-    async getItems() {
-        return apiRequest('/local/items', {
+    async getItems(refresh = false) {
+        const params = new URLSearchParams();
+        if (refresh) {
+            params.append('refresh', 'true');
+        }
+
+        const queryString = params.toString();
+        const url = `/local/items${queryString ? `?${queryString}` : ''}`;
+
+        return apiRequest(url, {
             cache: 'no-store',
         });
     },

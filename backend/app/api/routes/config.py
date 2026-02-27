@@ -32,7 +32,7 @@ from ...services.llm_providers.registry import (
     get_provider_models,
 )
 from ...services.llm_providers.base import ProviderInfo, ModelInfo
-from ...services.local_library_service import validate_local_root
+from ...services.local_library_service import LocalLibraryService, validate_local_root
 import logging
 
 logger = logging.getLogger(__name__)
@@ -260,6 +260,7 @@ async def handle_source_setup(request: SourceSetupRequest):
             if not save_local_config(local_config):
                 return SourceSetupResponse(success=False, message="Failed to save local configuration")
 
+            LocalLibraryService.clear_scan_cache()
             refresh_app_config()
             app_state.step = Step.LLM_SETUP
             await app_state.broadcast_step_change(Step.LLM_SETUP)
@@ -304,6 +305,7 @@ async def update_local_config(request: LocalConfigRequest):
     if not save_local_config(local_config):
         raise HTTPException(status_code=500, detail="Failed to save local configuration")
 
+    LocalLibraryService.clear_scan_cache()
     refresh_app_config()
     return {"message": "Local configuration saved successfully", "resolved_path": validation["resolved_path"]}
 

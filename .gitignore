@@ -20,3 +20,5 @@ node_modules/
 # IDE
 .vscode/
 .idea/
+
+test-compose.yml

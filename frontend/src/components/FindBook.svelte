@@ -321,11 +321,13 @@
         }
     }
 
-    async function loadLocalItems() {
+    async function loadLocalItems(refresh = false) {
+        if (isLoadingLocal) return;
+
         isLoadingLocal = true;
         localError = "";
         try {
-            localItems = await api.local.getItems();
+            localItems = await api.local.getItems(refresh);
         } catch (error) {
             console.error("Failed to load local items:", error);
             localError = error.message || "Failed to load local items";
@@ -500,9 +502,7 @@
     import {onMount} from "svelte";
 
     onMount(() => {
-        if ($session.sourceMode === "local") {
-            loadLocalItems();
-        } else if (inputMode === "search") {
+        if ($session.sourceMode !== "local" && inputMode === "search") {
             loadLibraries();
         }
     });
@@ -575,15 +575,16 @@
                 <div class="local-actions">
                     <button
                             class="btn btn-cancel"
-                            on:click={loadLocalItems}
+                            on:click={() => loadLocalItems(true)}
                             disabled={isLoadingLocal || $session.loading}
+                            title="Rescan local library"
                     >
                         {#if isLoadingLocal}
                             <span class="btn-spinner"></span>
-                            Refreshing...
+                            {localLoaded ? "Rescanning..." : "Scanning..."}
                         {:else}
                             <RefreshCw size="16"/>
-                            Refresh
+                            Rescan
                         {/if}
                     </button>
                 </div>
@@ -1405,7 +1406,7 @@
         width: 100%;
         max-width: 600px;
         display: flex;
-        justify-content: flex-end;
+        justify-content: center;
         margin-top: -0.5rem;
     }
 
