@@ -25,6 +25,53 @@ function createAudioStore() {
 
     let audioElement = null;
     let currentPlayPromise = null;
+    let playRequestId = 0;
+
+    const isPlaybackInterruption = (error) => {
+        if (!error) return false;
+        const message = String(error.message || '').toLowerCase();
+        return (
+            error.name === 'AbortError' ||
+            message.includes('interrupted') ||
+            message.includes('media was removed from the document')
+        );
+    };
+
+    const waitForMetadata = (audio, requestId) =>
+        new Promise((resolve, reject) => {
+            if (audio.readyState >= 1 && Number.isFinite(audio.duration)) {
+                resolve();
+                return;
+            }
+
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error('Timed out waiting for audio metadata'));
+            }, 10000);
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                audio.removeEventListener('loadedmetadata', onLoadedMetadata);
+                audio.removeEventListener('error', onError);
+            };
+
+            const onLoadedMetadata = () => {
+                cleanup();
+                if (requestId !== playRequestId) {
+                    reject(new DOMException('Playback request superseded', 'AbortError'));
+                    return;
+                }
+                resolve();
+            };
+
+            const onError = (e) => {
+                cleanup();
+                reject(e?.target?.error || new Error('Failed to load audio metadata'));
+            };
+
+            audio.addEventListener('loadedmetadata', onLoadedMetadata);
+            audio.addEventListener('error', onError);
+        });
 
     // Create audio element
     const createAudioElement = () => {
@@ -89,6 +136,7 @@ function createAudioStore() {
         // Playback controls
         async play(segmentId, chapterTimestamp = null) {
             const audio = createAudioElement();
+            const requestId = ++playRequestId;
 
             update(state => ({
                 ...state,
@@ -97,10 +145,7 @@ function createAudioStore() {
             }));
 
             try {
-                // Cancel any current play promise
-                if (currentPlayPromise) {
-                    currentPlayPromise = null;
-                }
+                currentPlayPromise = null;
 
                 // Stop current audio if playing
                 if (audioElement && !audioElement.paused) {
@@ -108,15 +153,12 @@ function createAudioStore() {
                     audioElement.currentTime = 0;
                 }
 
-                // Force clear audio source and reload to avoid cache issues
-                audio.src = '';
-                audio.load();
-
                 // Get streaming URL
                 const streamUrl = api.audio.getStreamUrl();
 
                 // Set new source
                 audio.src = streamUrl;
+                audio.load();
 
                 // Update state with new segment
                 update(state => ({
@@ -128,20 +170,10 @@ function createAudioStore() {
                 }));
 
                 if (chapterTimestamp !== null) {
-                    await new Promise((resolve, reject) => {
-                        const onLoadedMetadata = () => {
-                            audio.removeEventListener('loadedmetadata', onLoadedMetadata);
-                            audio.removeEventListener('error', onError);
-                            resolve();
-                        };
-                        const onError = (e) => {
-                            audio.removeEventListener('loadedmetadata', onLoadedMetadata);
-                            audio.removeEventListener('error', onError);
-                            reject(e);
-                        };
-                        audio.addEventListener('loadedmetadata', onLoadedMetadata);
-                        audio.addEventListener('error', onError);
-                    });
+                    await waitForMetadata(audio, requestId);
+                    if (requestId !== playRequestId) {
+                        return;
+                    }
 
                     audio.currentTime = chapterTimestamp;
                 }
@@ -151,6 +183,10 @@ function createAudioStore() {
                 await currentPlayPromise;
                 currentPlayPromise = null;
 
+                if (requestId !== playRequestId) {
+                    return;
+                }
+
                 // Update loading state
                 update(state => ({
                     ...state,
@@ -159,6 +195,15 @@ function createAudioStore() {
 
             } catch (error) {
                 currentPlayPromise = null;
+
+                if (requestId !== playRequestId || isPlaybackInterruption(error)) {
+                    update(state => ({
+                        ...state,
+                        loading: false
+                    }));
+                    return;
+                }
+
                 const errorMessage = `Failed to play audio: ${error.message}`;
                 update(state => ({
                     ...state,
@@ -173,22 +218,10 @@ function createAudioStore() {
 
         // Changed from pause to stop - resets playback progress
         stop() {
-            // Wait for any current play promise to complete before stopping
-            if (currentPlayPromise) {
-                currentPlayPromise.then(() => {
-                    if (audioElement) {
-                        audioElement.pause();
-                        audioElement.currentTime = 0;
-                    }
-                }).catch(() => {
-                    // Ignore errors from interrupted promises
-                    if (audioElement) {
-                        audioElement.pause();
-                        audioElement.currentTime = 0;
-                    }
-                });
-                currentPlayPromise = null;
-            } else if (audioElement) {
+            playRequestId += 1;
+            currentPlayPromise = null;
+
+            if (audioElement) {
                 audioElement.pause();
                 audioElement.currentTime = 0;
             }
@@ -197,6 +230,7 @@ function createAudioStore() {
                 ...state,
                 isPlaying: false,
                 currentTime: 0,
+                loading: false,
                 currentSegmentId: null
             }));
         },
@@ -235,6 +269,9 @@ function createAudioStore() {
 
         // Clear segment cache when chapters change
         clearSegmentCache() {
+            playRequestId += 1;
+            currentPlayPromise = null;
+
             // Stop any current playback
             if (audioElement) {
                 audioElement.pause();
@@ -261,6 +298,8 @@ function createAudioStore() {
 
         // Cleanup
         destroy() {
+            playRequestId += 1;
+            currentPlayPromise = null;
             if (audioElement) {
                 audioElement.pause();
                 audioElement.src = '';

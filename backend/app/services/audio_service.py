@@ -4,6 +4,8 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import uuid
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -361,6 +363,13 @@ class AudioProcessingService:
                 "-y",
                 "-i",
                 audio_file,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
                 "-f",
                 "segment",  # Segment mode
                 "-segment_times",
@@ -497,9 +506,30 @@ class AudioProcessingService:
 
                 trimmed_path = path.replace("segment_", "trimmed_")
                 trimmed_paths.append(trimmed_path)
+                is_wav_input = Path(path).suffix.lower() == ".wav"
 
                 if copy_only:
-                    shutil.copy2(path, trimmed_path)
+                    if is_wav_input:
+                        subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-i",
+                                path,
+                                "-vn",
+                                "-ac",
+                                "1",
+                                "-ar",
+                                "16000",
+                                "-c:a",
+                                "pcm_s16le",
+                                trimmed_path,
+                            ],
+                            capture_output=True,
+                            check=True,
+                        )
+                    else:
+                        shutil.copy2(path, trimmed_path)
                     continue
 
                 # Use synchronous version for trimming (called from thread)
@@ -523,10 +553,29 @@ class AudioProcessingService:
                         path,
                         "-t",
                         str(trim_point),
-                        "-c",
-                        "copy",
-                        trimmed_path,
                     ]
+
+                    if is_wav_input:
+                        trim_cmd.extend(
+                            [
+                                "-vn",
+                                "-ac",
+                                "1",
+                                "-ar",
+                                "16000",
+                                "-c:a",
+                                "pcm_s16le",
+                            ]
+                        )
+                    else:
+                        trim_cmd.extend(
+                            [
+                                "-c",
+                                "copy",
+                            ]
+                        )
+
+                    trim_cmd.append(trimmed_path)
 
                     try:
                         process = subprocess.Popen(trim_cmd)
@@ -544,7 +593,27 @@ class AudioProcessingService:
                             logger.error(
                                 f"Failed to trim segment {path}, will use untrimmed copy:\nExit code {process.returncode}\n{process.stderr.read()}"
                             )
-                            shutil.copy2(path, trimmed_path)
+                            if is_wav_input:
+                                subprocess.run(
+                                    [
+                                        "ffmpeg",
+                                        "-y",
+                                        "-i",
+                                        path,
+                                        "-vn",
+                                        "-ac",
+                                        "1",
+                                        "-ar",
+                                        "16000",
+                                        "-c:a",
+                                        "pcm_s16le",
+                                        trimmed_path,
+                                    ],
+                                    capture_output=True,
+                                    check=True,
+                                )
+                            else:
+                                shutil.copy2(path, trimmed_path)
                             continue
                     finally:
                         try:
@@ -554,7 +623,27 @@ class AudioProcessingService:
 
                 # If no silences were found, just copy the file without trimming
                 if not silences:
-                    shutil.copy2(path, trimmed_path)
+                    if is_wav_input:
+                        subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-i",
+                                path,
+                                "-vn",
+                                "-ac",
+                                "1",
+                                "-ar",
+                                "16000",
+                                "-c:a",
+                                "pcm_s16le",
+                                trimmed_path,
+                            ],
+                            capture_output=True,
+                            check=True,
+                        )
+                    else:
+                        shutil.copy2(path, trimmed_path)
 
                 # Update trimming progress
                 if len(paths) > 0:
@@ -645,6 +734,7 @@ class AudioProcessingService:
         self,
         input_files: List[str],
         total_duration: Optional[float] = None,
+        output_dir: Optional[str] = None,
     ) -> Optional[str]:
         """Concatenate multiple audio files into one"""
 
@@ -654,7 +744,7 @@ class AudioProcessingService:
         loop = asyncio.get_event_loop()
 
         # Start the concatenation in background
-        executor_task = loop.run_in_executor(None, self._run_concat_files, input_files, total_duration)
+        executor_task = loop.run_in_executor(None, self._run_concat_files, input_files, total_duration, output_dir)
 
         # Process queued progress updates while waiting
         while not executor_task.done():
@@ -678,6 +768,7 @@ class AudioProcessingService:
         self,
         input_files: List[str],
         total_duration: Optional[float] = None,
+        output_dir: Optional[str] = None,
     ) -> Optional[str]:
         """
         Concatenate multiple audio files into one using ffmpeg concat demuxer.
@@ -687,11 +778,43 @@ class AudioProcessingService:
             logger.error("At least two input files are required for concatenation.")
             return None
 
+        source_dir = os.path.dirname(input_files[0])
+        target_dir = output_dir or os.path.join(tempfile.gettempdir(), "achew", "cache", "concat")
+        if os.path.abspath(target_dir) == os.path.abspath(source_dir):
+            # Never write concat artifacts next to source media files.
+            target_dir = os.path.join(tempfile.gettempdir(), "achew", "cache", "concat")
+            logger.warning("Concat output directory matched source directory; redirected to cache")
+        os.makedirs(target_dir, exist_ok=True)
+        logger.info(f"Concatenating {len(input_files)} files into {target_dir}")
+
         # Determine output extension from first file
         ext = Path(input_files[0]).suffix.lstrip(".")
         if ext in ["m4b", "m4a", "mp4"]:
             ext = "aac"
-        output_file = os.path.join(os.path.dirname(input_files[0]), "concatenated." + ext)
+        run_id = uuid.uuid4().hex
+        output_file = os.path.join(target_dir, f"concatenated_{run_id}.{ext}")
+        fallback_output_file = os.path.join(target_dir, f"concatenated_{run_id}.wav")
+
+        for existing_output in [output_file, fallback_output_file]:
+            if os.path.exists(existing_output):
+                try:
+                    os.remove(existing_output)
+                except Exception:
+                    pass
+
+        # Clean up legacy concat artifacts from older versions that wrote to source folders.
+        legacy_paths = [
+            os.path.join(source_dir, f"concatenated.{ext}"),
+            os.path.join(source_dir, "concatenated.wav"),
+            os.path.join(source_dir, "concat_filelist.txt"),
+        ]
+        for legacy_path in legacy_paths:
+            if os.path.exists(legacy_path):
+                try:
+                    os.remove(legacy_path)
+                    logger.info(f"Removed legacy concat artifact: {legacy_path}")
+                except Exception:
+                    logger.warning(f"Failed to remove legacy concat artifact: {legacy_path}")
 
         if not total_duration:
             self._progress_queue.append(
@@ -704,7 +827,8 @@ class AudioProcessingService:
             )
 
         # Create a temporary file list for ffmpeg concat demuxer
-        filelist_path = os.path.join(os.path.dirname(input_files[0]), "concat_filelist.txt")
+        filelist_path = os.path.join(target_dir, f"concat_filelist_{run_id}.txt")
+        process = None
         try:
             with open(filelist_path, "w", encoding="utf-8") as f:
                 for path in input_files:
@@ -712,7 +836,7 @@ class AudioProcessingService:
                     escaped_path = path.replace("'", "'\\''")
                     f.write(f"file '{escaped_path}'\n")
 
-            cmd = [
+            primary_cmd = [
                 "ffmpeg",
                 "-y",
                 "-progress",
@@ -731,92 +855,135 @@ class AudioProcessingService:
                 "copy",
                 output_file,
             ]
-            process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-            self._running_processes.append(process)
+            fallback_cmd = [
+                "ffmpeg",
+                "-y",
+                "-progress",
+                "pipe:2",
+                "-stats_period",
+                "0.1",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                filelist_path,
+                "-map",
+                "0:a",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                "-c:a",
+                "pcm_s16le",
+                fallback_output_file,
+            ]
 
-            stderr_output = []
+            commands = [
+                (primary_cmd, output_file, "copy"),
+                (fallback_cmd, fallback_output_file, "reencode"),
+            ]
 
-            # Parse progress output in real-time
-            current_time = 0.0
-            last_progress_update = 0.0
+            for cmd, cmd_output_file, mode in commands:
+                process = subprocess.Popen(
+                    cmd,
+                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self._running_processes.append(process)
 
-            for line in process.stderr:
-                line = line.strip()
-                stderr_output.append(line)
+                stderr_output = []
+                current_time = 0.0
+                last_progress_update = 0.0
 
-                # Parse time progress from ffmpeg output
-                if total_duration and line.startswith("out_time_ms="):
-                    try:
-                        time_ms = int(line.split("=")[1])
-                        current_time = time_ms / 1000000.0  # Convert microseconds to seconds
+                for line in process.stderr:
+                    line = line.strip()
+                    stderr_output.append(line)
 
-                        # Update progress if we have total duration and significant progress change
-                        if current_time > last_progress_update + 1.0:  # Update every second
-                            progress_percent = min((current_time / total_duration) * 100, 100)
+                    # Parse time progress from ffmpeg output
+                    if total_duration and line.startswith("out_time_ms="):
+                        try:
+                            time_ms = int(line.split("=")[1])
+                            current_time = time_ms / 1000000.0  # Convert microseconds to seconds
 
-                            # Format time display
-                            current_time_str = _format_time(current_time)
-                            total_time_str = _format_time(total_duration)
+                            # Update progress if we have total duration and significant progress change
+                            if current_time > last_progress_update + 1.0:  # Update every second
+                                progress_percent = min((current_time / total_duration) * 100, 100)
 
-                            message = f"Preparing files... ({current_time_str} / {total_time_str})"
-                            details = {
-                                "current_time": current_time,
-                                "total_duration": total_duration,
-                                "files_count": len(input_files),
-                            }
+                                # Format time display
+                                current_time_str = _format_time(current_time)
+                                total_time_str = _format_time(total_duration)
 
-                            # Queue progress update for async processing
+                                message = f"Preparing files... ({current_time_str} / {total_time_str})"
+                                details = {
+                                    "current_time": current_time,
+                                    "total_duration": total_duration,
+                                    "files_count": len(input_files),
+                                }
+
+                                # Queue progress update for async processing
+                                self._progress_queue.append(
+                                    {
+                                        "step": Step.FILE_PREP,
+                                        "percent": progress_percent,
+                                        "message": message,
+                                        "details": details,
+                                    }
+                                )
+
+                                last_progress_update = current_time
+
+                        except (ValueError, IndexError):
+                            pass
+                    elif line.startswith("progress=") and line.endswith("end"):
+                        if total_duration:
                             self._progress_queue.append(
                                 {
                                     "step": Step.FILE_PREP,
-                                    "percent": progress_percent,
-                                    "message": message,
-                                    "details": details,
+                                    "percent": 100.0,
+                                    "message": "File concatenation completed",
+                                    "details": {
+                                        "current_time": total_duration,
+                                        "total_duration": total_duration,
+                                        "files_count": len(input_files),
+                                    },
                                 }
                             )
 
-                            last_progress_update = current_time
+                process.wait()
 
-                    except (ValueError, IndexError):
+                if process.returncode == 0 and os.path.exists(cmd_output_file) and os.path.getsize(cmd_output_file) > 0:
+                    try:
+                        self._running_processes.remove(process)
+                    except ValueError:
                         pass
-                elif line.startswith("progress=") and line.endswith("end"):
-                    # Concatenation completed
-                    if total_duration:
-                        self._progress_queue.append(
-                            {
-                                "step": Step.FILE_PREP,
-                                "percent": 100.0,
-                                "message": "File concatenation completed",
-                                "details": {
-                                    "current_time": total_duration,
-                                    "total_duration": total_duration,
-                                    "files_count": len(input_files),
-                                },
-                            }
-                        )
+                    return cmd_output_file
 
-            # Wait for process to complete
-            process.wait()
-
-            if process.returncode != 0:
-                logger.error(f"ffmpeg concat failed with return code {process.returncode}.\nffmpeg output:\n" + "\n".join(stderr_output))
-                return None
-
-            if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-                logger.error(f"Concatenated output file was not created or is empty: {output_file}.\nffmpeg output:\n" + "\n".join(stderr_output))
-                return None
-
-            return output_file
+                logger.warning(
+                    f"ffmpeg concat ({mode}) failed with return code {process.returncode}.\n"
+                    f"ffmpeg output:\n" + "\n".join(stderr_output)
+                )
+                try:
+                    self._running_processes.remove(process)
+                except ValueError:
+                    pass
         except Exception as e:
             logger.error(f"Exception during file concatenation: {e}")
             return None
         finally:
-            try:
-                self._running_processes.remove(process)
-            except ValueError:
-                pass
+            if process is not None:
+                try:
+                    self._running_processes.remove(process)
+                except ValueError:
+                    pass
             if os.path.exists(filelist_path):
                 try:
                     os.remove(filelist_path)
                 except Exception:
                     pass
+
+        return None

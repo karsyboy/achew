@@ -4,9 +4,9 @@ from typing import List, Optional, Dict
 
 from app.services.processing_pipeline import ExistingCueSource, PipelineProgress
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
-from ...core.config import is_abs_configured
+from ...core.config import get_configuration_status
 from ...models.abs import Book
 from ...models.enums import RestartStep, Step
 from ...app import get_app_state
@@ -17,7 +17,10 @@ router = APIRouter()
 
 
 class CreatePipelineRequest(BaseModel):
-    item_id: str
+    item_id: str = ""
+    source_type: str = "abs"  # "abs" | "local"
+    local_item_id: str = ""
+    local_layout: Optional[str] = None  # "single_file" | "multi_file_grouped" | "multi_file_individual"
 
 
 class CueSourceRequest(BaseModel):
@@ -49,8 +52,14 @@ class RealignChapterRequest(BaseModel):
     dramatized: bool
 
 
+class SubmitPipelineRequest(BaseModel):
+    create_backup: StrictBool = False
+
+
 class PipelineStateResponse(BaseModel):
     item_id: str
+    source_type: str = "abs"
+    local_media_layout: Optional[str] = None
     step: str
     progress: PipelineProgress
     selection_stats: Dict[str, int]
@@ -64,25 +73,54 @@ class PipelineStateResponse(BaseModel):
 @router.post("/pipeline", response_model=dict)
 async def create_pipeline(request: CreatePipelineRequest, background_tasks: BackgroundTasks):
     """Create a new processing pipeline"""
-    # Check if API is configured
-    if not is_abs_configured():
-        raise HTTPException(
-            status_code=400,
-            detail="ABS configuration required. Please configure ABS API key first.",
-        )
+    config_status = get_configuration_status()
+    if config_status.get("needs_source_setup"):
+        raise HTTPException(status_code=400, detail="Source mode configuration required")
+
+    if request.source_type not in {"abs", "local"}:
+        raise HTTPException(status_code=400, detail="source_type must be 'abs' or 'local'")
+
+    if request.source_type == "abs":
+        if config_status.get("source_mode") != "abs":
+            raise HTTPException(status_code=400, detail="Current source mode is not Audiobookshelf")
+        if config_status.get("needs_abs_setup"):
+            raise HTTPException(status_code=400, detail="ABS configuration required. Please configure ABS first.")
+        if not request.item_id:
+            raise HTTPException(status_code=400, detail="item_id is required for ABS pipelines")
+    else:
+        if config_status.get("source_mode") != "local":
+            raise HTTPException(status_code=400, detail="Current source mode is not local directory")
+        if not config_status.get("local_configured"):
+            raise HTTPException(status_code=400, detail="Local source is unavailable. Verify the /media mount.")
+        if not request.local_item_id:
+            raise HTTPException(status_code=400, detail="local_item_id is required for local pipelines")
 
     try:
         app_state = get_app_state()
-        pipeline = app_state.create_pipeline(request.item_id)
+        pipeline = app_state.create_pipeline(
+            item_id=request.item_id,
+            source_type=request.source_type,
+            local_item_id=request.local_item_id,
+            local_layout_hint=request.local_layout,
+        )
 
         # Start processing in background
         async def start_processing():
             try:
-                result = await pipeline.fetch_item(request.item_id)
+                result = await pipeline.fetch_item()
                 logger.info(f"Fetched item: {result}")
 
-                await app_state._broadcast_book_update()
+                # Pipeline may have been cancelled/replaced while background fetch was running.
+                if app_state.pipeline is not pipeline:
+                    logger.info("Skipping post-fetch updates because pipeline is no longer active")
+                    return
 
+                try:
+                    await app_state._broadcast_book_update()
+                except Exception as e:
+                    logger.warning(f"Failed to broadcast book update: {e}", exc_info=True)
+
+                # Always attempt the step transition even if book update broadcasting fails.
                 await app_state.broadcast_step_change(
                     Step.SELECT_CUE_SOURCE,
                     extras={"cue_sources": pipeline.existing_cue_sources},
@@ -118,15 +156,12 @@ async def get_pipeline_state():
         # Get stats from pipeline
         stats = pipeline.get_selection_stats()
 
-        progress = PipelineProgress(
-            step=pipeline.step,
-            percent=0.0,  # Would need to get from pipeline
-            message="",  # Would need to get from pipeline
-            details={},
-        )
+        progress = pipeline.progress if pipeline.progress else PipelineProgress(step=pipeline.step)
 
         return PipelineStateResponse(
             item_id=pipeline.item_id,
+            source_type=pipeline.source_type,
+            local_media_layout=getattr(pipeline, "local_media_layout", None),
             step=app_state.step.value,
             progress=progress,
             selection_stats=stats,
@@ -164,8 +199,8 @@ async def delete_pipeline():
 
 
 @router.post("/pipeline/submit")
-async def submit_chapters():
-    """Submit chapters to Audiobookshelf"""
+async def submit_chapters(request: Optional[SubmitPipelineRequest] = None):
+    """Submit chapters (ABS) or write chapter metadata to local files (local mode)."""
     try:
         app_state = get_app_state()
         pipeline = app_state.pipeline
@@ -180,9 +215,13 @@ async def submit_chapters():
                 detail="Pipeline must be in chapter_editing or reviewing step to submit",
             )
 
-        success = await pipeline.submit_chapters(pipeline.chapters)
+        submit_request = request or SubmitPipelineRequest()
+        logger.info(f"Submitting chapters source={pipeline.source_type} create_backup={submit_request.create_backup}")
+        success = await pipeline.submit_chapters(pipeline.chapters, create_backup=submit_request.create_backup)
 
         if success:
+            # Completed pipelines no longer need temporary processing files.
+            pipeline.cleanup_all_files()
             pipeline.step = Step.COMPLETED
             await app_state.broadcast_step_change(Step.COMPLETED)
             return {"message": "Chapters submitted successfully"}

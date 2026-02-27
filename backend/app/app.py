@@ -35,8 +35,14 @@ class AppState:
     @property
     def step(self) -> Step:
         config_status = get_configuration_status()
-        if config_status["needs_abs_setup"]:
+        if config_status.get("needs_source_setup"):
+            return Step.SOURCE_SETUP
+
+        if config_status.get("needs_abs_setup"):
             return Step.ABS_SETUP
+
+        if config_status.get("needs_local_setup"):
+            return Step.LOCAL_SETUP
 
         if self._app_step:
             return self._app_step
@@ -51,7 +57,13 @@ class AppState:
         """Set the current application step and broadcast change"""
         self._app_step = value
 
-    def create_pipeline(self, item_id: str):
+    def create_pipeline(
+        self,
+        item_id: str = "",
+        source_type: str = "abs",
+        local_item_id: str = "",
+        local_layout_hint: Optional[str] = None,
+    ):
         """Create a new processing pipeline for the given item"""
         # Only allow one pipeline at a time
         if self.pipeline:
@@ -66,9 +78,17 @@ class AppState:
         )
 
         # Create pipeline
-        self.pipeline = ProcessingPipeline(item_id=item_id, progress_callback=progress_callback)
+        self.pipeline = ProcessingPipeline(
+            item_id=item_id,
+            progress_callback=progress_callback,
+            source_type=source_type,
+            local_item_id=local_item_id,
+            local_layout_hint=local_layout_hint,
+        )
 
-        logger.info(f"Created pipeline for item {item_id}")
+        logger.info(
+            f"Created pipeline source_type={source_type} item_id={item_id} local_item_id={local_item_id} layout={local_layout_hint}"
+        )
         return self.pipeline
 
     def delete_pipeline(self) -> bool:

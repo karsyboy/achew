@@ -127,6 +127,27 @@
         }
     }
 
+    async function handleSwitchSourceMode() {
+        try {
+            loading = true;
+            const response = await fetch("/api/goto-source-setup", {
+                method: "POST",
+            });
+            if (!response.ok) {
+                validationStatus = {valid: false, message: "Failed to switch source mode"};
+                validationStatus = {...validationStatus};
+                return;
+            }
+            dispatch("abs-configured");
+        } catch (error) {
+            console.error("Error switching source mode:", error);
+            validationStatus = {valid: false, message: "Network error"};
+            validationStatus = {...validationStatus};
+        } finally {
+            loading = false;
+        }
+    }
+
     // Reactive status calculations
     $: statusClass = !validationStatus
         ? "subtle"
@@ -233,6 +254,13 @@
         </div>
 
         <div class="form-actions">
+            <button
+                    class="btn btn-cancel"
+                    disabled={loading}
+                    on:click={handleSwitchSourceMode}
+            >
+                Switch Source Mode
+            </button>
             {#if showCancelButton}
                 <button
                         class="btn btn-cancel"

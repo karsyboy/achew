@@ -43,8 +43,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy in ffmpeg
+# Copy in ffmpeg + ffprobe (local scan uses ffprobe for metadata/duration)
 COPY --from=ffmpeg /ffmpeg /usr/local/bin/
+COPY --from=ffmpeg /ffprobe /usr/local/bin/
 
 WORKDIR /achew
 

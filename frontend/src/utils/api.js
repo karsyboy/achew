@@ -66,10 +66,14 @@ async function apiRequest(endpoint, options = {}) {
 
 // Session API
 export const session = {
-    async create(itemId) {
+    async create(payload) {
+        const body = typeof payload === 'string'
+            ? {item_id: payload}
+            : payload;
+
         return apiRequest('/pipeline', {
             method: 'POST',
-            body: {item_id: itemId},
+            body,
         });
     },
 
@@ -83,9 +87,10 @@ export const session = {
         });
     },
 
-    async submit() {
+    async submit(options = {}) {
         return apiRequest('/pipeline/submit', {
             method: 'POST',
+            body: options,
         });
     },
 
@@ -409,6 +414,47 @@ export const config = {
             body: settings,
         });
     },
+
+    async getSourceMode() {
+        return apiRequest('/config/source');
+    },
+
+    async setSourceMode(mode) {
+        return apiRequest('/config/source', {
+            method: 'POST',
+            body: {mode},
+        });
+    },
+
+    async setupSource(mode) {
+        return apiRequest('/config/source/setup', {
+            method: 'POST',
+            body: {action: 'verify_and_save', mode},
+        });
+    },
+
+    async getLocalConfig() {
+        return apiRequest('/config/local');
+    },
+
+    async validateLocalPath(rootPath) {
+        return apiRequest('/config/local/validate', {
+            method: 'POST',
+            body: {root_path: rootPath},
+        });
+    },
+
+    async setupLocal(rootPath) {
+        return apiRequest('/config/local/setup', {
+            method: 'POST',
+            body: {action: 'verify_and_save', root_path: rootPath},
+        });
+    },
+
+    async browseLocalDirectories(path = '') {
+        const query = path ? `?path=${encodeURIComponent(path)}` : '';
+        return apiRequest(`/config/local/browse${query}`);
+    },
 };
 
 // LLM API
@@ -484,6 +530,13 @@ export const audiobookshelf = {
     },
 };
 
+// Local source API
+export const local = {
+    async getItems() {
+        return apiRequest('/local/items');
+    },
+};
+
 // Export the main API object
 export const api = {
     session,
@@ -494,6 +547,7 @@ export const api = {
     config,
     llm,
     audiobookshelf,
+    local,
 };
 
 export default api;

@@ -6,10 +6,11 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from typing import Optional, List, Dict, Any, Tuple
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Literal
 
 from app.app import get_app_state
-from app.models.abs import AudioFile, Book
+from app.models.abs import AudioFile, Book, AudioFileMetadata, BookChapter, BookMedia, BookMetadata
 from pydantic import BaseModel, Field
 from .abs_service import ABSService
 from .asr_service import create_asr_service
@@ -21,6 +22,8 @@ from ..models.enums import RestartStep, Step
 from ..models.progress import ProgressCallback
 from ..models.chapter_operation import AICleanupOperation, BatchChapterOperation, ChapterOperation
 from .chapter_aligner import ChapterAligner
+from .local_library_service import LocalLibraryService
+from .local_chapter_service import LocalChapterService
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +113,23 @@ class AIOptions:
 class ProcessingPipeline:
     """Main processing pipeline that orchestrates the entire chapter generation workflow"""
 
-    def __init__(self, item_id: str, progress_callback: ProgressCallback, smart_detect_config=None):
+    def __init__(
+        self,
+        item_id: str,
+        progress_callback: ProgressCallback,
+        smart_detect_config=None,
+        source_type: str = "abs",
+        local_item_id: str = "",
+        local_layout_hint: Optional[str] = None,
+    ):
         self.progress_callback: ProgressCallback = progress_callback
         self.item_id = item_id
+        self.source_type: Literal["abs", "local"] = "local" if source_type == "local" else "abs"
+        self.local_item_id = local_item_id
+        self.local_layout_hint = local_layout_hint
+        self.local_media_layout: Literal["single_file", "multi_file_grouped", "multi_file_individual"] = "single_file"
+        self.local_audio_files: List[str] = []
+        self.local_rel_paths: List[str] = []
         self._running_processes = []
         self._transcription_task = None
         self._extraction_task = None
@@ -124,7 +141,7 @@ class ProcessingPipeline:
 
         # Create temporary directory
         sys_tmp_dir = tempfile.gettempdir()
-        base_tmp_dir = os.path.join(sys_tmp_dir, "achew")
+        base_tmp_dir = os.path.join(sys_tmp_dir, "achew", "cache")
         os.makedirs(base_tmp_dir, exist_ok=True)
         self.temp_dir = tempfile.mkdtemp(dir=base_tmp_dir, prefix=str(uuid.uuid4()))
         logger.info(f"Created temp directory: {self.temp_dir}")
@@ -469,6 +486,12 @@ class ProcessingPipeline:
         """Notify progress via callback"""
         old_step = self.step
         self.step = step
+        self.progress = PipelineProgress(
+            step=step,
+            percent=percent,
+            message=message,
+            details=details or {},
+        )
         if old_step != step:
             asyncio.create_task(get_app_state().broadcast_step_change(step))
         self.progress_callback(step, percent, message, details or {})
@@ -593,7 +616,205 @@ class ProcessingPipeline:
             logger.error(f"Error during download: {e}")
             raise
 
-    async def fetch_item(self, item_id: str) -> Dict[str, Any]:
+    @staticmethod
+    def _mime_type_for_extension(path: Path) -> str:
+        ext = path.suffix.lower()
+        if ext in {".m4b", ".m4a", ".mp4"}:
+            return "audio/mp4"
+        if ext == ".mp3":
+            return "audio/mpeg"
+        if ext == ".flac":
+            return "audio/flac"
+        if ext == ".wav":
+            return "audio/wav"
+        if ext == ".aac":
+            return "audio/aac"
+        if ext == ".ogg":
+            return "audio/ogg"
+        return "audio/mpeg"
+
+    def _build_local_book(self, name: str, audio_files: List[AudioFile], total_duration: float) -> Book:
+        metadata = BookMetadata(
+            title=name,
+            authorName="",
+            narratorName="",
+            genres=[],
+            publishedYear=None,
+            description=None,
+        )
+        media = BookMedia(
+            metadata=metadata,
+            coverPath="",
+            duration=total_duration,
+            audioFiles=audio_files,
+            chapters=[],
+            numChapters=0,
+            numAudioFiles=len(audio_files),
+        )
+        return Book(
+            id=self.item_id or self.local_item_id or str(uuid.uuid4()),
+            addedAt=0,
+            updatedAt=0,
+            media=media,
+        )
+
+    async def fetch_item(self, item_id: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch and prepare the selected source item for processing."""
+        if self.source_type == "local":
+            return await self._fetch_local_item()
+
+        target_item_id = item_id or self.item_id
+        if not target_item_id:
+            raise RuntimeError("item_id is required for ABS source pipelines")
+        return await self._fetch_abs_item(target_item_id)
+
+    async def _fetch_local_item(self) -> Dict[str, Any]:
+        if not self.local_item_id:
+            raise RuntimeError("local_item_id is required for local source pipelines")
+
+        try:
+            self._notify_progress(Step.VALIDATING, 0, "Validating local item...")
+            local_service = LocalLibraryService.from_config()
+            resolved = local_service.resolve_candidate(
+                self.local_item_id,
+                layout_hint=self.local_layout_hint,
+            )
+            self.local_media_layout = resolved.media_layout
+            self.local_audio_files = [str(path) for path in resolved.audio_files]
+            self.local_rel_paths = resolved.rel_paths
+            self.item_id = resolved.item_id
+
+            self._notify_progress(Step.VALIDATING, 15, "Reading local file metadata...")
+
+            audio_file_models: List[AudioFile] = []
+            embedded_cues: List[SimpleChapter] = []
+            file_start_cues: List[SimpleChapter] = []
+            current_start = 0.0
+
+            total_files = len(resolved.audio_files)
+            should_probe_embedded = True
+            validated_total_duration = 0.0
+            for idx, (path, rel_path, duration) in enumerate(
+                zip(resolved.audio_files, resolved.rel_paths, resolved.durations)
+            ):
+                self._notify_progress(
+                    Step.VALIDATING,
+                    min(55, 20 + ((idx + 1) / total_files) * 35),
+                    f"Validating file {idx + 1} of {total_files}...",
+                )
+                is_valid, validation_error, validated_duration = local_service.validate_audio_file(path)
+                if not is_valid:
+                    raise RuntimeError(f"Validation failed for '{rel_path}': {validation_error}")
+
+                effective_duration = validated_duration if validated_duration > 0 else duration
+
+                self._notify_progress(
+                    Step.VALIDATING,
+                    min(80, 55 + ((idx + 1) / total_files) * 25),
+                    f"Reading metadata for file {idx + 1} of {total_files}...",
+                )
+                # Probe embedded chapters for all local starts, including single-file books.
+                chapters = local_service.get_embedded_chapters(path) if should_probe_embedded else []
+                chapter_models: List[BookChapter] = []
+                for chapter_idx, (start, title) in enumerate(chapters):
+                    next_start = (
+                        chapters[chapter_idx + 1][0] if chapter_idx + 1 < len(chapters) else effective_duration
+                    )
+                    chapter_models.append(
+                        BookChapter(
+                            title=title,
+                            start=start,
+                            end=next_start,
+                        )
+                    )
+                    embedded_cues.append(
+                        SimpleChapter(
+                            timestamp=current_start + start,
+                            title=title,
+                        )
+                    )
+
+                audio_file_models.append(
+                    AudioFile(
+                        ino=rel_path,
+                        mimeType=self._mime_type_for_extension(path),
+                        duration=effective_duration,
+                        metadata=AudioFileMetadata(
+                            filename=path.name,
+                            ext=path.suffix.lstrip("."),
+                            relPath=rel_path,
+                            size=path.stat().st_size,
+                        ),
+                        chapters=chapter_models,
+                    )
+                )
+
+                file_start_cues.append(
+                    SimpleChapter(
+                        timestamp=current_start,
+                        title=path.name,
+                    )
+                )
+                current_start += effective_duration
+                validated_total_duration += effective_duration
+
+            self.book = self._build_local_book(resolved.name, audio_file_models, validated_total_duration)
+            self.existing_cue_sources = []
+
+            if embedded_cues:
+                self.existing_cue_sources.append(
+                    ExistingCueSource(
+                        id="embedded",
+                        name="Embedded Chapters",
+                        short_name="Embedded",
+                        description="Uses chapter data from embedded metadata in the local audio files",
+                        cues=sorted(embedded_cues, key=lambda cue: cue.timestamp),
+                        duration=self.book.duration,
+                    )
+                )
+
+            if file_start_cues:
+                self.existing_cue_sources.append(
+                    ExistingCueSource(
+                        id="file_starts",
+                        name="File Info",
+                        short_name="Files",
+                        description="Uses local file start positions as cue data",
+                        cues=file_start_cues,
+                        duration=self.book.duration,
+                    )
+                )
+                self.file_starts = [cue.timestamp for cue in file_start_cues]
+            else:
+                self.file_starts = None
+
+            if len(resolved.audio_files) == 1:
+                self.audio_file_path = str(resolved.audio_files[0])
+            else:
+                self._notify_progress(Step.FILE_PREP, 0, "Preparing local files...")
+                audio_service = AudioProcessingService(
+                    self._notify_progress, self.smart_detect_config, self._running_processes
+                )
+                concatenated = await audio_service.concat_files(
+                    [str(path) for path in resolved.audio_files],
+                    validated_total_duration,
+                    output_dir=self.temp_dir,
+                )
+                if not concatenated or not os.path.exists(concatenated):
+                    raise RuntimeError(
+                        "Failed to merge local audio files for grouped processing. "
+                        "Try enabling 'Treat files as individual books' for this folder."
+                    )
+                self.audio_file_path = concatenated
+
+            self._notify_progress(Step.SELECT_CUE_SOURCE, 100, "Local item ready")
+            return {"success": True, "step": Step.SELECT_CUE_SOURCE}
+        except Exception as e:
+            logger.error(f"Fetching local item failed: {e}", exc_info=True)
+            await self.restart_at_step(RestartStep.IDLE, f"Fetching local item failed: {str(e)}")
+            raise
+
+    async def _fetch_abs_item(self, item_id: str) -> Dict[str, Any]:
         """Fetch the audiobook info and files for processing"""
 
         # Store the item_id for later use
@@ -774,7 +995,11 @@ class ProcessingPipeline:
                     audio_service = AudioProcessingService(
                         self._notify_progress, self.smart_detect_config, self._running_processes
                     )
-                    concatenated_file = await audio_service.concat_files(audio_file_paths, total_duration)
+                    concatenated_file = await audio_service.concat_files(
+                        audio_file_paths,
+                        total_duration,
+                        output_dir=self.temp_dir,
+                    )
 
                     if not concatenated_file or not os.path.exists(concatenated_file):
                         error_msg = "Failed to merge audio files for processing. This may be due to incompatible audio formats, corrupted files, or insufficient disk space. Please check the application logs for detailed error information."
@@ -1515,31 +1740,73 @@ class ProcessingPipeline:
         """Get the number of segments that will be transcribed"""
         return len(self.cues) if self.cues else 0
 
-    async def submit_chapters(self, chapters: List[ChapterData]) -> bool:
-        """Submit final chapters to Audiobookshelf"""
+    async def submit_chapters(self, chapters: List[ChapterData], create_backup: bool = False) -> bool:
+        """Submit final chapters to ABS or write chapters for local source mode."""
+        selected_chapters = [chapter for chapter in chapters if chapter.selected]
+        selected_chapters.sort(key=lambda chapter: chapter.timestamp)
 
-        # Convert chapters to the format expected by ABS
-        chapter_data = []
-        for chapter in chapters:
-            if chapter.selected:  # Only submit selected chapters
-                chapter_data.append((chapter.timestamp, chapter.current_title))
+        if not selected_chapters:
+            raise RuntimeError("No chapters selected for submission")
 
-        try:
-            async with ABSService() as abs_service:
-                success = await abs_service.upload_chapters(
-                    self.book.id,
-                    chapter_data,
-                    self.book.duration,
-                )
+        if self.source_type == "local":
+            try:
+                if self.local_media_layout == "multi_file_grouped":
+                    if len(self.local_audio_files) < 2:
+                        raise RuntimeError("Grouped local write requested, but source files were not tracked")
 
-                if success:
-                    self._notify_progress(Step.COMPLETED, 100, "Chapter submission completed successfully")
+                    if len(selected_chapters) != len(self.local_audio_files):
+                        raise RuntimeError(
+                            "Grouped multi-file write requires one selected chapter per source file. "
+                            "Adjust chapter count to match file count."
+                        )
 
-                return success
+                    expected_starts = self.file_starts or []
+                    if len(expected_starts) != len(selected_chapters):
+                        raise RuntimeError("Grouped multi-file mapping data is unavailable for write-back")
 
-        except Exception as e:
-            logger.error(f"Chapter submission failed: {e}")
-            return False
+                    mapping_valid, mapping_error = LocalChapterService.validate_grouped_boundary_mapping(
+                        [chapter.timestamp for chapter in selected_chapters],
+                        expected_starts,
+                        tolerance=0.75,
+                    )
+                    if not mapping_valid:
+                        raise RuntimeError(f"{mapping_error} Reset timestamps to file-start cues and try again.")
+
+                    LocalChapterService.write_grouped_file_titles(
+                        self.local_audio_files,
+                        [chapter.current_title for chapter in selected_chapters],
+                        create_backup=create_backup,
+                    )
+                else:
+                    if not self.local_audio_files:
+                        raise RuntimeError("No local audio file available for write-back")
+
+                    LocalChapterService.write_single_file_chapters(
+                        self.local_audio_files[0],
+                        [(chapter.timestamp, chapter.current_title) for chapter in selected_chapters],
+                        create_backup=create_backup,
+                    )
+
+                self._notify_progress(Step.COMPLETED, 100, "Local chapter write completed successfully")
+                return True
+
+            except Exception as e:
+                logger.error(f"Local chapter write failed: {e}", exc_info=True)
+                raise RuntimeError(str(e)) from e
+
+        # ABS source path
+        chapter_data = [(chapter.timestamp, chapter.current_title) for chapter in selected_chapters]
+        async with ABSService() as abs_service:
+            success = await abs_service.upload_chapters(
+                self.book.id,
+                chapter_data,
+                self.book.duration,
+            )
+            if not success:
+                raise RuntimeError("Failed to submit chapters to Audiobookshelf")
+
+        self._notify_progress(Step.COMPLETED, 100, "Chapter submission completed successfully")
+        return True
 
     async def process_selected_with_ai(self, ai_options=None) -> bool:
         """Process selected chapters with AI enhancement"""

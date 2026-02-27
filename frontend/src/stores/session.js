@@ -8,6 +8,9 @@ function createSessionStore() {
         // Session info
         step: 'idle',
         itemId: '',
+        sourceMode: 'unset',
+        pipelineSourceType: 'abs',
+        localMediaLayout: null,
 
         // Progress tracking
         progress: {
@@ -167,25 +170,40 @@ function createSessionStore() {
         subscribe,
 
         // Session management
-        async createSession(itemId) {
+        async createSession(payload) {
             update(state => ({...state, loading: true, error: null}));
 
             try {
-                const response = await api.session.create(itemId);
-
-                update(state => ({
-                    ...state,
-                    itemId,
-                    loading: false
-                }));
-
-                // Ensure WebSocket connection is established (but don't force reconnect if already connected)
+                // Connect first so early validation/progress/cue updates are not missed.
                 connectWebSocket();
-                // Setup handlers if not already done
                 if (!webSocketHandlersSetup) {
                     setupWebSocketHandlers();
                     webSocketHandlersSetup = true;
                 }
+
+                await api.session.create(payload);
+
+                const resolvedItemId = typeof payload === 'string'
+                    ? payload
+                    : (payload.item_id || payload.local_item_id || '');
+                const resolvedSourceType = typeof payload === 'string'
+                    ? 'abs'
+                    : (payload.source_type || 'abs');
+                const resolvedLocalLayout = typeof payload === 'string'
+                    ? null
+                    : (payload.local_layout || null);
+
+                update(state => ({
+                    ...state,
+                    itemId: resolvedItemId,
+                    pipelineSourceType: resolvedSourceType,
+                    localMediaLayout: resolvedLocalLayout,
+                    loading: true
+                }));
+
+                // Force refresh of full pipeline state (including cue_sources/progress),
+                // in case initial websocket events happened before handlers were attached.
+                await this.loadSession();
 
                 return true;
             } catch (error) {
@@ -210,6 +228,8 @@ function createSessionStore() {
                     ...state,
                     step: data.step,
                     itemId: data.item_id,
+                    pipelineSourceType: data.source_type || 'abs',
+                    localMediaLayout: data.local_media_layout || null,
                     progress: data.progress,
                     selectionStats: data.selection_stats,
                     canUndo: data.can_undo,
@@ -244,11 +264,15 @@ function createSessionStore() {
 
             try {
                 await api.session.delete();
+                const currentState = get({subscribe});
 
                 // Reset to initial state
                 set({
                     step: 'idle',
                     itemId: '',
+                    sourceMode: currentState.sourceMode || 'unset',
+                    pipelineSourceType: 'abs',
+                    localMediaLayout: null,
                     progress: {step: 'idle', percent: 0, message: '', details: {}},
                     chapters: [],
                     selectionStats: {total: 0, selected: 0, unselected: 0},
@@ -281,10 +305,14 @@ function createSessionStore() {
 
         // Reset session state without making API call (for when backend already deleted session)
         resetToIdle() {
+            const currentState = get({subscribe});
             // Reset to initial state (same as deleteSession but without API call)
             set({
                 step: 'idle',
                 itemId: '',
+                sourceMode: currentState.sourceMode || 'unset',
+                pipelineSourceType: 'abs',
+                localMediaLayout: null,
                 progress: {step: 'idle', percent: 0, message: '', details: {}},
                 chapters: [],
                 selectionStats: {total: 0, selected: 0, unselected: 0},
@@ -504,6 +532,9 @@ function createSessionStore() {
                     update(state => ({
                         ...state,
                         step: response.step,
+                        sourceMode: response.source_mode || state.sourceMode,
+                        pipelineSourceType: response.pipeline_source_type || state.pipelineSourceType,
+                        localMediaLayout: response.pipeline_local_layout || state.localMediaLayout,
                         version: response.version || null
                     }));
                 }

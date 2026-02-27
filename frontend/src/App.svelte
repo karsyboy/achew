@@ -5,6 +5,8 @@
 
     // Pages
     import ABSSetup from "./components/ABSSetup.svelte";
+    import SourceSetup from "./components/SourceSetup.svelte";
+    import LocalSetup from "./components/LocalSetup.svelte";
     import AICleanup from "./components/AICleanup.svelte";
     import ChapterEditor from "./components/ChapterEditor.svelte";
     import ChapterReview from "./components/ChapterReview.svelte";
@@ -85,8 +87,12 @@
         if (!mounted) return Connecting;
         if (checkingConfig || !$isConnected) return Connecting;
         switch ($session.step) {
+            case "source_setup":
+                return SourceSetup;
             case "abs_setup":
                 return ABSSetup;
+            case "local_setup":
+                return LocalSetup;
             case "llm_setup":
                 return LLMSetup;
             case "validating":
@@ -273,7 +279,7 @@
 
     // Check if restart button should be shown
     function shouldShowRestartButton(restartOptions) {
-        return !["abs_setup", "llm_setup", "idle"].includes($session.step);
+        return !["source_setup", "abs_setup", "local_setup", "llm_setup", "idle"].includes($session.step);
     }
 
     // Check if restart button should be disabled
@@ -330,6 +336,23 @@
         }
     }
 
+    async function gotoSourceSetup() {
+        closeSettingsMenu();
+        try {
+            const response = await fetch("/api/goto-source-setup", {
+                method: "POST",
+            });
+
+            if (response.ok) {
+                await session.loadActiveSession();
+            } else {
+                console.error("Failed to navigate to source setup");
+            }
+        } catch (error) {
+            console.error("Error navigating to source setup:", error);
+        }
+    }
+
     async function gotoLLMSetup() {
         closeSettingsMenu();
         try {
@@ -348,10 +371,9 @@
         }
     }
 
-    // Check if settings button should be shown (hide during setup steps and while connecting)
+    // Keep settings available in setup flows so source mode can always be switched.
     $: isConnectingView = currentComponent === Connecting;
-    $: shouldShowSettings =
-        !["abs_setup", "llm_setup"].includes($session.step) && !isConnectingView;
+    $: shouldShowSettings = $session.step !== "source_setup" && !isConnectingView;
 
     $: updateAvailable = isNewerVersion($session.version, latestVersion);
 </script>
@@ -447,6 +469,14 @@
                         {#if showSettingsMenu}
                             <div class="settings-dropdown">
                                 <div class="settings-options">
+                                    <button
+                                            class="settings-option"
+                                            on:click={gotoSourceSetup}
+                                            disabled={$session.loading}
+                                    >
+                                        <Workflow size="16"/>
+                                        Source Mode
+                                    </button>
                                     <button
                                             class="settings-option"
                                             on:click={gotoABSSetup}

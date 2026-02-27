@@ -7,6 +7,7 @@
     // Icons
     import ArrowRight from "@lucide/svelte/icons/arrow-right";
     import Check from "@lucide/svelte/icons/check";
+    import ChevronDown from "@lucide/svelte/icons/chevron-down";
     import CircleQuestionMark from "@lucide/svelte/icons/circle-question-mark";
     import RefreshCw from "@lucide/svelte/icons/refresh-cw";
 
@@ -43,6 +44,49 @@
     let isFetchingMissingChapters = false;
     let isRefreshingCache = false;
     let missingChaptersError = "";
+
+    // Local mode variables
+    let localItems = [];
+    let isLoadingLocal = false;
+    let localError = "";
+    let localLoaded = false;
+    let groupedLocalItems = [];
+    let singleLocalItems = [];
+    let localStandaloneGroups = [];
+    let showCompletedMessage = false;
+
+    $: groupedLocalItems = localItems.filter(
+        (item) => item.candidate_type === "multi_file_folder_book",
+    );
+    $: singleLocalItems = localItems.filter(
+        (item) => item.candidate_type === "single_file_book",
+    );
+    $: {
+        const grouped = new Map();
+        for (const item of singleLocalItems) {
+            const slash = item.rel_path.lastIndexOf("/");
+            const parentPath = slash >= 0 ? item.rel_path.slice(0, slash) : ".";
+            if (!grouped.has(parentPath)) {
+                grouped.set(parentPath, []);
+            }
+            grouped.get(parentPath).push(item);
+        }
+        localStandaloneGroups = Array.from(grouped.entries())
+            .map(([parentPath, files]) => ({
+                parentPath,
+                files: files.sort((a, b) => a.rel_path.localeCompare(b.rel_path)),
+            }))
+            .sort((a, b) => {
+                const aIsRoot = a.parentPath === ".";
+                const bIsRoot = b.parentPath === ".";
+                if (aIsRoot && !bIsRoot) return -1;
+                if (!aIsRoot && bIsRoot) return 1;
+                return a.parentPath.localeCompare(b.parentPath, undefined, {
+                    numeric: true,
+                    sensitivity: "base",
+                });
+            });
+    }
 
     // Format duration for display
     function formatDuration(seconds) {
@@ -256,6 +300,36 @@
         }
     }
 
+    async function loadLocalItems() {
+        isLoadingLocal = true;
+        localError = "";
+        try {
+            localItems = await api.local.getItems();
+        } catch (error) {
+            console.error("Failed to load local items:", error);
+            localError = error.message || "Failed to load local items";
+        } finally {
+            isLoadingLocal = false;
+            localLoaded = true;
+        }
+    }
+
+    async function startLocalSession(item, layoutOverride = null) {
+        isValidating = true;
+        try {
+            await session.createSession({
+                source_type: "local",
+                local_item_id: item.id,
+                local_layout: layoutOverride || item.processing_mode,
+            });
+        } catch (error) {
+            console.error("Failed to create local session:", error);
+            localError = error.message || "Failed to create session";
+        } finally {
+            isValidating = false;
+        }
+    }
+
     async function loadMissingChaptersBooks() {
         if (!missingChaptersLibrary) return;
 
@@ -374,17 +448,30 @@
         filteredMissingChaptersBooks = [];
         missingChaptersError = "";
         maxChapters = 0;
-        api.audiobookshelf.clearAllCache().catch(console.error);
+
+        localItems = [];
+        localLoaded = false;
+        localError = "";
+
+        if ($session.sourceMode !== "local") {
+            api.audiobookshelf.clearAllCache().catch(console.error);
+        }
     }
 
     // Load libraries on component mount if starting in search mode
     import {onMount} from "svelte";
 
     onMount(() => {
-        if (inputMode === "search") {
+        if ($session.sourceMode === "local") {
+            loadLocalItems();
+        } else if (inputMode === "search") {
             loadLibraries();
         }
     });
+
+    $: if ($session.sourceMode === "local" && !localLoaded && !isLoadingLocal) {
+        loadLocalItems();
+    }
 
     // Show different content based on session state
     $: showCompletedMessage = $session.step === "completed";
@@ -398,10 +485,15 @@
                     <Check size="72" color="var(--success)"/>
                 </div>
 
-                <h2 class="text-success">Chapters Submitted!</h2>
+                <h2 class="text-success">
+                    {$session.pipelineSourceType === "local" ? "Local Chapters Saved!" : "Chapters Submitted!"}
+                </h2>
                 <p>
-                    Your audiobook chapters have been successfully saved to
-                    Audiobookshelf.
+                    {#if $session.pipelineSourceType === "local"}
+                        Your audiobook files were updated successfully.
+                    {:else}
+                        Your audiobook chapters have been successfully saved to Audiobookshelf.
+                    {/if}
                 </p>
                 <div class="actions">
                     <button
@@ -440,32 +532,183 @@
                 </div>
             </div>
 
-            <!-- Mode Selector -->
-            <div class="mode-selector">
-                <button
-                        class="mode-btn {inputMode === 'search' ? 'active' : ''}"
-                        on:click={switchToSearchMode}
-                        type="button"
-                >
-                    Search
-                </button>
-                <button
-                        class="mode-btn {inputMode === 'itemId' ? 'active' : ''}"
-                        on:click={switchToItemIdMode}
-                        type="button"
-                >
-                    Item ID
-                </button>
-                <button
-                        class="mode-btn {inputMode === 'missingChapters' ? 'active' : ''}"
-                        on:click={switchToMissingChaptersMode}
-                        type="button"
-                >
-                    Missing Chapters
-                </button>
-            </div>
+            {#if $session.sourceMode === "local"}
+                <div class="local-header">
+                    <h3>Local Library</h3>
+                    <p>Select a single file or folder candidate from your configured local root.</p>
+                </div>
 
-            {#if inputMode === "itemId"}
+                <div class="local-actions">
+                    <button
+                            class="btn btn-cancel"
+                            on:click={loadLocalItems}
+                            disabled={isLoadingLocal || $session.loading}
+                    >
+                        {#if isLoadingLocal}
+                            <span class="btn-spinner"></span>
+                            Refreshing...
+                        {:else}
+                            <RefreshCw size="16"/>
+                            Refresh
+                        {/if}
+                    </button>
+                </div>
+
+                {#if localError}
+                    <div class="alert alert-danger local-alert">{localError}</div>
+                {/if}
+
+                {#if isLoadingLocal}
+                    <div class="loading-indicator">
+                        <span class="loading-spinner"></span>
+                        Scanning local files...
+                    </div>
+                {:else if groupedLocalItems.length === 0 && singleLocalItems.length === 0}
+                    <div class="no-results">
+                        <p>No supported audiobook files were found.</p>
+                        <p class="hint">Supported formats: `.m4b`, `.m4a`</p>
+                    </div>
+                {:else}
+                    <div class="local-results">
+                        {#if groupedLocalItems.length > 0}
+                            <div class="local-section folders-section">
+                                <h4>Folders</h4>
+                                <div class="results-list">
+                                    {#each groupedLocalItems as item (item.id)}
+                                        <details class="local-card local-card-details">
+                                            <summary class="local-card-main">
+                                                <div class="local-toggle-btn">
+                                                    <span class="local-chevron">
+                                                        <ChevronDown size="16"/>
+                                                    </span>
+                                                    <span class="local-title">{item.name}</span>
+                                                </div>
+                                                <div class="search-result-actions">
+                                                    <button
+                                                            class="btn btn-verify start-btn"
+                                                            on:click|stopPropagation|preventDefault={() => startLocalSession(item, "multi_file_grouped")}
+                                                            disabled={$session.loading || isValidating}
+                                                    >
+                                                        {#if $session.loading || isValidating}
+                                                            <span class="btn-spinner"></span>
+                                                            Processing...
+                                                        {:else}
+                                                            Start Folder
+                                                            <ArrowRight size="14"/>
+                                                        {/if}
+                                                    </button>
+                                                </div>
+                                            </summary>
+                                            <div class="local-subtitle">{item.rel_path}</div>
+                                            <div class="local-meta">
+                                                {item.file_count} files • {formatDuration(item.duration || 0)}
+                                            </div>
+                                            <div class="local-split-list">
+                                                <div class="local-split-note">
+                                                    Files in folder (start any file to process it as an individual book):
+                                                </div>
+                                                {#each item.individual_items as splitItem (splitItem.id)}
+                                                    <div class="local-split-row">
+                                                        <div>
+                                                            <div class="local-split-title">{splitItem.name}</div>
+                                                            <div class="local-split-subtitle">{splitItem.rel_path}</div>
+                                                        </div>
+                                                        <button
+                                                                class="btn btn-cancel btn-sm"
+                                                                on:click={() =>
+                                                                        startLocalSession(
+                                                                                splitItem,
+                                                                                "multi_file_individual",
+                                                                        )}
+                                                                disabled={$session.loading || isValidating}
+                                                        >
+                                                            Start File
+                                                        </button>
+                                                    </div>
+                                                {/each}
+                                                {#if item.individual_items.length === 0}
+                                                    <div class="folder-empty">No individual file candidates found.</div>
+                                                {/if}
+                                            </div>
+                                        </details>
+                                    {/each}
+                                </div>
+                            </div>
+                        {/if}
+
+                        {#if localStandaloneGroups.length > 0}
+                            <div class="local-section files-section">
+                                <h4>Files</h4>
+                                <div class="results-list">
+                                    {#each localStandaloneGroups as group (group.parentPath)}
+                                        <details class="local-card local-card-details" open={group.parentPath === "."}>
+                                            <summary class="local-toggle-btn">
+                                                <span class="local-chevron">
+                                                    <ChevronDown size="16"/>
+                                                </span>
+                                                <span class="local-title">{group.parentPath === "." ? "/" : group.parentPath}</span>
+                                            </summary>
+                                            <div class="local-subtitle">
+                                                Standalone files in this folder
+                                            </div>
+                                            <div class="local-split-list">
+                                                {#each group.files as item (item.id)}
+                                                    <div class="local-split-row">
+                                                        <div>
+                                                            <div class="local-split-title">{item.name}</div>
+                                                            <div class="local-split-subtitle">{item.rel_path}</div>
+                                                            <div class="local-meta">{formatDuration(item.duration || 0)}</div>
+                                                        </div>
+                                                        <button
+                                                                class="btn btn-verify btn-sm"
+                                                                on:click={() => startLocalSession(item, "single_file")}
+                                                                disabled={$session.loading || isValidating}
+                                                        >
+                                                            {#if $session.loading || isValidating}
+                                                                <span class="btn-spinner"></span>
+                                                                Processing...
+                                                            {:else}
+                                                                Start File
+                                                                <ArrowRight size="14"/>
+                                                            {/if}
+                                                        </button>
+                                                    </div>
+                                                {/each}
+                                            </div>
+                                        </details>
+                                    {/each}
+                                </div>
+                            </div>
+                        {/if}
+                    </div>
+                {/if}
+            {:else}
+                <!-- Mode Selector -->
+                <div class="mode-selector">
+                    <button
+                            class="mode-btn {inputMode === 'search' ? 'active' : ''}"
+                            on:click={switchToSearchMode}
+                            type="button"
+                    >
+                        Search
+                    </button>
+                    <button
+                            class="mode-btn {inputMode === 'itemId' ? 'active' : ''}"
+                            on:click={switchToItemIdMode}
+                            type="button"
+                    >
+                        Item ID
+                    </button>
+                    <button
+                            class="mode-btn {inputMode === 'missingChapters' ? 'active' : ''}"
+                            on:click={switchToMissingChaptersMode}
+                            type="button"
+                    >
+                        Missing Chapters
+                    </button>
+                </div>
+
+                {#if inputMode === "itemId"}
                 <!-- Item ID Input Form -->
                 <form on:submit|preventDefault={handleSubmit} class="item-form">
                     <div class="form-group">
@@ -737,6 +980,7 @@
                         <p>No books found with {maxChapters} chapter{maxChapters === 1 ? '' : 's'} or fewer.</p>
                         <p class="hint">Try increasing the chapter count or clicking the refresh button.</p>
                     </div>
+                {/if}
                 {/if}
             {/if}
         </div>
@@ -1081,6 +1325,152 @@
         flex-shrink: 0;
     }
 
+    .local-header {
+        text-align: center;
+        margin-top: -0.5rem;
+    }
+
+    .local-header h3 {
+        margin: 0;
+    }
+
+    .local-header p {
+        margin: 0.5rem 0 0 0;
+        color: var(--text-secondary);
+    }
+
+    .local-actions {
+        width: 100%;
+        max-width: 600px;
+        display: flex;
+        justify-content: flex-end;
+        margin-top: -0.5rem;
+    }
+
+    .local-alert {
+        width: 100%;
+        max-width: 600px;
+        margin-bottom: 0;
+    }
+
+    .local-results {
+        width: 100%;
+        max-width: 720px;
+        display: grid;
+        gap: 1.25rem;
+    }
+
+    .local-section h4 {
+        margin: 0 0 0.5rem 0;
+        font-size: 0.95rem;
+        color: var(--text-secondary);
+    }
+
+    .local-section.files-section {
+        order: 0;
+    }
+
+    .local-section.folders-section {
+        order: 1;
+    }
+
+    .local-card {
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+        padding: 0.85rem;
+        display: grid;
+        gap: 0.75rem;
+        background: color-mix(in srgb, var(--bg-card) 92%, transparent);
+    }
+
+    .local-card-details > summary {
+        list-style: none;
+        cursor: pointer;
+    }
+
+    .local-card-details > summary::-webkit-details-marker {
+        display: none;
+    }
+
+    .local-card-main {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .local-toggle-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        border: none;
+        background: transparent;
+        color: inherit;
+        padding: 0;
+        cursor: pointer;
+        min-width: 0;
+        text-align: left;
+    }
+
+    .local-chevron {
+        color: var(--text-secondary);
+        transition: transform 0.16s ease;
+        flex-shrink: 0;
+        transform: rotate(-90deg);
+    }
+
+    .local-card-details[open] .local-chevron {
+        transform: rotate(0deg);
+    }
+
+    .local-title {
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
+    .local-subtitle {
+        font-size: 0.82rem;
+        color: var(--text-secondary);
+        margin-top: 0.2rem;
+        word-break: break-word;
+    }
+
+    .local-meta {
+        font-size: 0.8rem;
+        color: var(--text-muted);
+        margin-top: 0.25rem;
+    }
+
+    .local-split-list {
+        border-top: 1px solid var(--border-color);
+        padding-top: 0.75rem;
+        display: grid;
+        gap: 0.5rem;
+    }
+
+    .local-split-note {
+        font-size: 0.82rem;
+        color: var(--text-secondary);
+    }
+
+    .local-split-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .local-split-title {
+        font-size: 0.9rem;
+        color: var(--text-primary);
+    }
+
+    .local-split-subtitle {
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+        word-break: break-word;
+    }
+
     /* Responsive design */
     @media (max-width: 768px) {
         .session-start {
@@ -1142,6 +1532,16 @@
 
         .search-input {
             min-width: auto;
+        }
+
+        .local-card-main,
+        .local-split-row {
+            flex-direction: column;
+            align-items: stretch;
+        }
+
+        .local-actions {
+            justify-content: center;
         }
 
         .success-card .card-body {

@@ -1,19 +1,26 @@
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ...core.config import (
     get_app_config,
+    get_effective_local_root,
     save_abs_config,
+    save_local_config,
+    save_source_config,
     save_llm_provider_config,
     get_user_preferences,
     update_user_preferences,
     refresh_app_config,
     ABSConfig,
+    LocalConfig,
+    SourceConfig,
     LLMProviderConfig,
+    get_settings,
 )
 from ...models.enums import Step
 from ...app import get_app_state
@@ -25,6 +32,7 @@ from ...services.llm_providers.registry import (
     get_provider_models,
 )
 from ...services.llm_providers.base import ProviderInfo, ModelInfo
+from ...services.local_library_service import validate_local_root
 import logging
 
 logger = logging.getLogger(__name__)
@@ -119,6 +127,288 @@ async def validate_openai_key(api_key: str) -> Dict[str, Any]:
         return {"valid": False, "message": "OpenAI API timeout"}
     except Exception as e:
         return {"valid": False, "message": f"OpenAI API error: {str(e)}"}
+
+
+def validate_local_config_path(root_path: str) -> Dict[str, Any]:
+    settings = get_settings()
+    valid, message, resolved = validate_local_root(root_path, settings.LOCAL_MEDIA_BASE)
+    return {
+        "valid": valid,
+        "message": message,
+        "resolved_path": str(resolved) if resolved else "",
+        "sandbox_base": settings.LOCAL_MEDIA_BASE,
+    }
+
+
+class SourceModeRequest(BaseModel):
+    mode: str
+
+
+class SourceModeResponse(BaseModel):
+    mode: str
+
+
+class LocalConfigRequest(BaseModel):
+    root_path: str
+
+
+class LocalConfigResponse(BaseModel):
+    root_path: str
+    validated: bool
+    last_validated: Optional[str] = None
+    sandbox_base: str
+
+
+class SourceSetupRequest(BaseModel):
+    action: str  # "verify_and_save" or "cancel"
+    mode: str = ""
+
+
+class SourceSetupResponse(BaseModel):
+    success: bool
+    message: str
+    errors: Dict[str, str] = {}
+
+
+class LocalSetupRequest(BaseModel):
+    action: str  # "verify_and_save" or "cancel"
+    root_path: str = ""
+
+
+class LocalSetupResponse(BaseModel):
+    success: bool
+    message: str
+    errors: Dict[str, str] = {}
+
+
+class LocalDirectoryOption(BaseModel):
+    name: str
+    path: str
+
+
+class LocalBrowseResponse(BaseModel):
+    current_path: str
+    sandbox_base: str
+    parent_path: Optional[str] = None
+    directories: List[LocalDirectoryOption] = []
+
+
+@router.get("/config/source", response_model=SourceModeResponse)
+async def get_source_mode_config():
+    config = get_app_config()
+    return SourceModeResponse(mode=config.source.mode)
+
+
+@router.post("/config/source")
+async def set_source_mode_config(request: SourceModeRequest):
+    if request.mode not in {"abs", "local", "unset"}:
+        raise HTTPException(status_code=400, detail="Source mode must be one of: abs, local, unset")
+
+    source_config = SourceConfig(mode=request.mode)
+    if not save_source_config(source_config):
+        raise HTTPException(status_code=500, detail="Failed to save source mode")
+
+    refresh_app_config()
+    return {"message": "Source mode updated successfully", "mode": request.mode}
+
+
+@router.post("/config/source/setup", response_model=SourceSetupResponse)
+async def handle_source_setup(request: SourceSetupRequest):
+    try:
+        app_state = get_app_state()
+
+        if request.action == "cancel":
+            if app_state.step == Step.SOURCE_SETUP:
+                app_state.step = None
+                await app_state.broadcast_step_change(Step.IDLE)
+            return SourceSetupResponse(success=True, message="Source setup cancelled")
+
+        if request.action != "verify_and_save":
+            return SourceSetupResponse(success=False, message=f"Unknown action: {request.action}")
+
+        if request.mode not in {"abs", "local"}:
+            return SourceSetupResponse(success=False, message="Invalid source mode", errors={"mode": "Required"})
+
+        if not save_source_config(SourceConfig(mode=request.mode)):
+            return SourceSetupResponse(success=False, message="Failed to save source mode")
+
+        refresh_app_config()
+        config = get_app_config()
+
+        if request.mode == "abs":
+            if config.abs.url and config.abs.api_key:
+                app_state.step = Step.LLM_SETUP
+                await app_state.broadcast_step_change(Step.LLM_SETUP)
+            else:
+                app_state.step = Step.ABS_SETUP
+                await app_state.broadcast_step_change(Step.ABS_SETUP)
+        else:
+            settings = get_settings()
+            local_check = validate_local_config_path(settings.LOCAL_MEDIA_BASE)
+            if not local_check["valid"]:
+                return SourceSetupResponse(
+                    success=False,
+                    message=f"Local source unavailable: {local_check['message']}",
+                    errors={"local": local_check["message"]},
+                )
+
+            local_config = LocalConfig(
+                root_path=local_check["resolved_path"] or settings.LOCAL_MEDIA_BASE,
+                validated=True,
+                last_validated=datetime.now(timezone.utc),
+            )
+            if not save_local_config(local_config):
+                return SourceSetupResponse(success=False, message="Failed to save local configuration")
+
+            refresh_app_config()
+            app_state.step = Step.LLM_SETUP
+            await app_state.broadcast_step_change(Step.LLM_SETUP)
+
+        return SourceSetupResponse(success=True, message="Source mode saved")
+
+    except Exception as e:
+        logger.error(f"Error in source setup: {e}", exc_info=True)
+        return SourceSetupResponse(success=False, message="Internal server error")
+
+
+@router.get("/config/local", response_model=LocalConfigResponse)
+async def get_local_config():
+    config = get_app_config()
+    settings = get_settings()
+    effective_root = get_effective_local_root()
+    return LocalConfigResponse(
+        root_path=effective_root or config.local.root_path or settings.LOCAL_MEDIA_BASE,
+        validated=bool(effective_root),
+        last_validated=config.local.last_validated.isoformat() if config.local.last_validated else None,
+        sandbox_base=settings.LOCAL_MEDIA_BASE,
+    )
+
+
+@router.post("/config/local")
+async def update_local_config(request: LocalConfigRequest):
+    validation = validate_local_config_path(request.root_path)
+    if not validation["valid"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Local path validation failed",
+                "validation": validation,
+            },
+        )
+
+    local_config = LocalConfig(
+        root_path=validation["resolved_path"] or request.root_path,
+        validated=True,
+        last_validated=datetime.now(timezone.utc),
+    )
+    if not save_local_config(local_config):
+        raise HTTPException(status_code=500, detail="Failed to save local configuration")
+
+    refresh_app_config()
+    return {"message": "Local configuration saved successfully", "resolved_path": validation["resolved_path"]}
+
+
+@router.post("/config/local/validate")
+async def validate_local_config(request: LocalConfigRequest):
+    return validate_local_config_path(request.root_path)
+
+
+@router.get("/config/local/browse", response_model=LocalBrowseResponse)
+async def browse_local_directories(path: Optional[str] = Query(default=None)):
+    settings = get_settings()
+
+    base_path = Path(settings.LOCAL_MEDIA_BASE).expanduser().resolve(strict=False)
+    if not base_path.exists() or not base_path.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Configured media base does not exist or is not a directory: {base_path}",
+        )
+
+    try:
+        if path:
+            candidate = Path(path).expanduser()
+            target = (base_path / candidate).resolve(strict=False) if not candidate.is_absolute() else candidate.resolve(strict=False)
+        else:
+            target = base_path
+
+        if not target.exists() or not target.is_dir():
+            raise HTTPException(status_code=400, detail=f"Directory does not exist: {target}")
+
+        base_real = base_path.resolve(strict=True)
+        target_real = target.resolve(strict=True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid directory path: {e}")
+
+    if target_real != base_real and base_real not in target_real.parents:
+        raise HTTPException(status_code=400, detail=f"Path must be inside sandbox base: {base_real}")
+
+    directories = []
+    try:
+        for child in target_real.iterdir():
+            if child.is_dir() and not child.name.startswith("."):
+                directories.append(LocalDirectoryOption(name=child.name, path=str(child.resolve(strict=True))))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list directories: {e}")
+
+    directories.sort(key=lambda option: option.name.lower())
+    parent_path = str(target_real.parent) if target_real != base_real else None
+
+    return LocalBrowseResponse(
+        current_path=str(target_real),
+        sandbox_base=str(base_real),
+        parent_path=parent_path,
+        directories=directories,
+    )
+
+
+@router.post("/config/local/setup", response_model=LocalSetupResponse)
+async def handle_local_setup(request: LocalSetupRequest):
+    try:
+        app_state = get_app_state()
+
+        if request.action == "cancel":
+            if app_state.step == Step.LOCAL_SETUP:
+                app_state.step = None
+                await app_state.broadcast_step_change(Step.IDLE)
+            return LocalSetupResponse(success=True, message="Local setup cancelled")
+
+        if request.action != "verify_and_save":
+            return LocalSetupResponse(success=False, message=f"Unknown action: {request.action}")
+
+        validation = validate_local_config_path(request.root_path)
+        if not validation["valid"]:
+            return LocalSetupResponse(success=False, message="Validation failed", errors={"local": validation["message"]})
+
+        config = get_app_config()
+        was_previously_configured = bool(config.local.root_path and config.local.validated)
+
+        local_config = LocalConfig(
+            root_path=validation["resolved_path"] or request.root_path,
+            validated=True,
+            last_validated=datetime.now(timezone.utc),
+        )
+        if not save_local_config(local_config):
+            return LocalSetupResponse(success=False, message="Failed to save local configuration")
+
+        if config.source.mode != "local":
+            save_source_config(SourceConfig(mode="local"))
+
+        refresh_app_config()
+
+        if was_previously_configured:
+            app_state.step = None
+            await app_state.broadcast_step_change(Step.IDLE)
+        else:
+            app_state.step = Step.LLM_SETUP
+            await app_state.broadcast_step_change(Step.LLM_SETUP)
+
+        return LocalSetupResponse(success=True, message="Local configuration saved successfully")
+
+    except Exception as e:
+        logger.error(f"Error in local setup: {e}", exc_info=True)
+        return LocalSetupResponse(success=False, message="Internal server error")
 
 
 @router.get("/config/abs", response_model=ABSConfigResponse)
@@ -327,6 +617,10 @@ async def handle_abs_setup(request: ABSSetupRequest):
                 if not save_abs_config(abs_config):
                     return ABSSetupResponse(success=False, message="Failed to save ABS configuration")
 
+                # ABS setup implies ABS mode.
+                if not save_source_config(SourceConfig(mode="abs")):
+                    return ABSSetupResponse(success=False, message="Failed to save source mode")
+
                 # Refresh global config cache
                 refresh_app_config()
 
@@ -357,7 +651,18 @@ async def handle_abs_setup(request: ABSSetupRequest):
 async def get_config_status():
     """Get configuration status (for checking if setup is needed)"""
     config = get_app_config()
+    source_mode = config.source.mode
     abs_configured = bool(config.abs.url and config.abs.api_key)
+    settings = get_settings()
+    effective_root = get_effective_local_root()
+    local_root_for_validation = effective_root or config.local.root_path
+    local_validation = validate_local_config_path(local_root_for_validation) if local_root_for_validation else {
+        "valid": False,
+        "message": "Not configured",
+        "resolved_path": "",
+        "sandbox_base": settings.LOCAL_MEDIA_BASE,
+    }
+    local_configured = local_validation["valid"]
     openai_configured = bool(config.llm.openai.api_key)
 
     # Quick validation if configured
@@ -379,10 +684,14 @@ async def get_config_status():
         }
 
     return {
-        "is_configured": abs_configured,
+        "is_configured": source_mode in {"abs", "local"},
+        "source_mode": source_mode,
+        "needs_source_setup": source_mode == "unset",
         "abs_configured": abs_configured,
+        "local_configured": local_configured,
+        "local_validation": local_validation,
         "openai_configured": openai_configured,
-        "needs_setup": not abs_configured,
+        "needs_setup": (source_mode == "abs" and not abs_configured) or (source_mode == "local" and not local_configured),
         "validation": validation_status,
     }
 

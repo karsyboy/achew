@@ -2,7 +2,7 @@ import shelve
 import logging
 import uuid
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -19,6 +19,20 @@ class ABSConfig(BaseModel):
 
     url: str = ""
     api_key: str = ""
+    validated: bool = False
+    last_validated: Optional[datetime] = None
+
+
+class SourceConfig(BaseModel):
+    """Global source mode configuration"""
+
+    mode: Literal["abs", "local", "unset"] = "unset"
+
+
+class LocalConfig(BaseModel):
+    """Local directory source configuration section"""
+
+    root_path: str = ""
     validated: bool = False
     last_validated: Optional[datetime] = None
 
@@ -96,7 +110,9 @@ class UserPreferences(BaseModel):
 class AppConfig(BaseModel):
     """Complete application configuration"""
 
+    source: SourceConfig = SourceConfig()
     abs: ABSConfig = ABSConfig()
+    local: LocalConfig = LocalConfig()
     llm: LLMConfig = LLMConfig()
     user_preferences: UserPreferences = UserPreferences()
     asr_options: ASROptions = ASROptions()
@@ -108,6 +124,7 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = False
+    LOCAL_MEDIA_BASE: str = "/media"
 
     class Config:
         case_sensitive = True
@@ -146,14 +163,18 @@ def load_config() -> AppConfig:
     try:
         with shelve.open(config_db_path, "c") as db:
             # Load each section, with defaults if not present
+            source_data = db.get("source", {})
             abs_data = db.get("abs", {})
+            local_data = db.get("local", {})
             llm_data = db.get("llm", {})
             user_prefs_data = db.get("user_preferences", {})
             asr_options_data = db.get("asr_options", {})
             custom_instructions_data = db.get("custom_instructions", {})
 
             # Create config objects with validation
+            source_config = SourceConfig(**source_data) if source_data else SourceConfig()
             abs_config = ABSConfig(**abs_data) if abs_data else ABSConfig()
+            local_config = LocalConfig(**local_data) if local_data else LocalConfig()
             llm_config = LLMConfig(**llm_data) if llm_data else LLMConfig()
             user_prefs = UserPreferences(**user_prefs_data) if user_prefs_data else UserPreferences()
             asr_options = ASROptions(**asr_options_data) if asr_options_data else ASROptions()
@@ -164,7 +185,9 @@ def load_config() -> AppConfig:
             )
 
             return AppConfig(
+                source=source_config,
                 abs=abs_config,
+                local=local_config,
                 llm=llm_config,
                 user_preferences=user_prefs,
                 asr_options=asr_options,
@@ -182,7 +205,9 @@ def save_config(config: AppConfig) -> bool:
 
     try:
         with shelve.open(config_db_path, "c") as db:
+            db["source"] = config.source.model_dump()
             db["abs"] = config.abs.model_dump()
+            db["local"] = config.local.model_dump()
             db["llm"] = config.llm.model_dump()
             db["user_preferences"] = config.user_preferences.model_dump()
             db["asr_options"] = config.asr_options.model_dump()
@@ -202,6 +227,28 @@ def save_abs_config(abs_config: ABSConfig) -> bool:
         return save_config(config)
     except Exception as e:
         logger.error(f"Failed to save ABS configuration: {e}")
+        return False
+
+
+def save_source_config(source_config: SourceConfig) -> bool:
+    """Save only source configuration section"""
+    try:
+        config = load_config()
+        config.source = source_config
+        return save_config(config)
+    except Exception as e:
+        logger.error(f"Failed to save source configuration: {e}")
+        return False
+
+
+def save_local_config(local_config: LocalConfig) -> bool:
+    """Save only local configuration section"""
+    try:
+        config = load_config()
+        config.local = local_config
+        return save_config(config)
+    except Exception as e:
+        logger.error(f"Failed to save local configuration: {e}")
         return False
 
 
@@ -285,6 +332,7 @@ def get_settings() -> Settings:
         logger.info(f"Loaded settings - HOST: {_settings.HOST}")
         logger.info(f"Loaded settings - PORT: {_settings.PORT}")
         logger.info(f"Loaded settings - DEBUG: {_settings.DEBUG}")
+        logger.info(f"Loaded settings - LOCAL_MEDIA_BASE: {_settings.LOCAL_MEDIA_BASE}")
         if _settings.DEBUG:
             logger.info(f"Loaded settings - CORS_ORIGINS (dev mode): {_settings.cors_origins_list}")
         else:
@@ -339,13 +387,63 @@ def is_abs_configured() -> bool:
     return bool(config.abs.url and config.abs.api_key)
 
 
+def get_source_mode() -> str:
+    """Get the current configured source mode"""
+    config = get_app_config()
+    return config.source.mode
+
+
+def get_effective_local_root() -> Optional[str]:
+    """
+    Return the effective local root path.
+    Priority:
+    1) Saved local root path when valid
+    2) LOCAL_MEDIA_BASE when valid
+    """
+    config = get_app_config()
+    settings = get_settings()
+
+    from ..services.local_library_service import validate_local_root
+
+    candidates = []
+    if config.local.root_path:
+        candidates.append(config.local.root_path)
+    candidates.append(settings.LOCAL_MEDIA_BASE)
+
+    for candidate in candidates:
+        valid, _, resolved = validate_local_root(candidate, settings.LOCAL_MEDIA_BASE)
+        if valid and resolved:
+            return str(resolved)
+
+    return None
+
+
+def is_local_configured() -> bool:
+    """Check if local source is configured"""
+    return bool(get_effective_local_root())
+
+
 def get_configuration_status() -> Dict[str, Any]:
     """Get overall configuration status for session management"""
     config = get_app_config()
+    source_mode = get_source_mode()
+    abs_configured = is_abs_configured()
+    local_configured = is_local_configured()
+    effective_local_root = get_effective_local_root()
+    needs_source_setup = source_mode == "unset"
+    needs_abs_setup = source_mode == "abs" and not abs_configured
+    needs_local_setup = False
 
     return {
-        "abs_configured": is_abs_configured(),
+        "source_mode": source_mode,
+        "source_configured": source_mode in {"abs", "local"},
+        "needs_source_setup": needs_source_setup,
+        "abs_configured": abs_configured,
         "abs_validated": config.abs.validated,
-        "needs_abs_setup": not is_abs_configured(),
+        "needs_abs_setup": needs_abs_setup,
+        "local_configured": local_configured,
+        "local_validated": local_configured,
+        "local_root_path": effective_local_root or config.local.root_path,
+        "needs_local_setup": needs_local_setup,
         "needs_llm_setup": False,  # LLM setup is always optional
     }

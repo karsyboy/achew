@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api.routes import core, chapters, audio, config, audiobookshelf, pipeline
+from .api.routes import core, chapters, audio, config, audiobookshelf, pipeline, local
 from .core.config import get_settings
 from .models.websocket import WSMessage, WSMessageType
 from .app import get_app_state
@@ -38,13 +38,23 @@ async def lifespan(achew_app: FastAPI):
     logger.info("Starting achew")
     logger.info(f"CORS origins: {settings.cors_origins_list}")
 
-    # Check API configuration
-    from .core.config import is_abs_configured
+    # Check source configuration
+    from .core.config import get_configuration_status
 
-    if is_abs_configured():
-        logger.info("ABS configuration found and loaded")
+    config_status = get_configuration_status()
+    source_mode = config_status.get("source_mode")
+    if source_mode == "abs":
+        if config_status.get("abs_configured"):
+            logger.info("ABS configuration found and loaded")
+        else:
+            logger.warning("ABS mode selected but ABS configuration is missing")
+    elif source_mode == "local":
+        if config_status.get("local_configured"):
+            logger.info("Local source configuration found and loaded")
+        else:
+            logger.warning("Local mode selected but local root configuration is missing")
     else:
-        logger.warning("ABS configuration missing - configuration required via web UI")
+        logger.info("Source mode is not configured yet")
 
     if static_dir:
         logger.info(f"Frontend found at {static_dir}")
@@ -110,6 +120,7 @@ app.include_router(config.router, prefix="/api", tags=["config"])
 app.include_router(chapters.router, prefix="/api", tags=["chapters"])
 app.include_router(audio.router, prefix="/api", tags=["audio"])
 app.include_router(audiobookshelf.router, prefix="/api/audiobookshelf", tags=["audiobookshelf"])
+app.include_router(local.router, prefix="/api/local", tags=["local"])
 
 # Setup static file serving
 static_dir = get_static_directory()
@@ -165,6 +176,7 @@ async def api_root():
             "chapters": "/api/chapters",
             "audio": "/api/audio",
             "audiobookshelf": "/api/audiobookshelf",
+            "local": "/api/local",
         },
     }
 

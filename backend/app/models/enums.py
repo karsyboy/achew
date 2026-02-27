@@ -2,7 +2,9 @@ from enum import Enum
 
 
 class Step(str, Enum):
+    SOURCE_SETUP = "source_setup"  # Interactive
     ABS_SETUP = "abs_setup"  # Interactive
+    LOCAL_SETUP = "local_setup"  # Interactive
     LLM_SETUP = "llm_setup"  # Interactive
     IDLE = "idle"  # Interactive
     VALIDATING = "validating"

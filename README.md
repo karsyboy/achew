@@ -6,14 +6,18 @@
   </picture>
 </div>
 
+# NOTE
+***This is a vibe coded fork of achew using OpenAI Codex 5.3 to add the ability to use achew without the need for Audiobookshelf. I wanted to create this so that I could use achews awesome feature with audiobook files that are stored on my server and available in booklore now that it supports audiobooks. I do not expect this fork to be merged upstream to the main achew project.***
+
 ## About
 
 #### **achew** is an Audiobook Chapter Extraction Wizard.
-Designed to work with [Audiobookshelf](https://www.audiobookshelf.org/), **achew** helps you analyze your audiobook files to find chapters and generate titles.
+Designed to work with [Audiobookshelf](https://www.audiobookshelf.org/) or a mounted local directory, **achew** helps you analyze audiobook files to find chapters and generate titles.
 
 ### Features
 
 - **Search**: Quickly find audiobooks in your Audiobookshelf libraries.
+- **Dual Source Modes**: Use either Audiobookshelf (search + submit) or Local Directory mode for mounted files inside the container.
 - **Smart Chapter Detection**: Automatically analyzes audio files to efficiently detect potential chapter cues.
 - **Uses Existing Chapters**: Uses existing chapter information from Audiobookshelf, Audnexus, or embedded chapters to compare against detected chapters, guide the AI Cleanup process, or simply generate new chapter titles for existing timestamps.
 - **Title Transcription**: Uses the Parakeet and Whisper ASR models to transcribe chapter titles. Apple Silicon devices can access the hardware-accelerated MLX versions of these models.
@@ -48,12 +52,16 @@ https://github.com/user-attachments/assets/cde5b668-2849-4fe5-88b7-db0f97d73019
 - [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
 
 ### 2. Gather Keys
-- Create an [Audiobookshelf API Key](https://www.audiobookshelf.org/guides/api-keys/#creating-api-keys)
+- If you plan to use Audiobookshelf mode, create an [Audiobookshelf API Key](https://www.audiobookshelf.org/guides/api-keys/#creating-api-keys)
 - **[Optional]** Create API key for OpenAI, Gemini, or Claude, or have access to a machine running Ollama or LM Studio. This is only required if you want to use the AI Cleanup feature.
 
 ### 3. Set Up the Compose File
 - Download the [docker-compose.yml](docker-compose.yml) file. This can go anywhere (e.g. inside a new directory named `achew` in your home directory).
 - Change the port and volume mappings if desired.
+- If you plan to use Local Directory mode, set the audiobook library bind mount:
+  - Host path: your audiobook folder
+  - Container path: `/media` (or your configured `LOCAL_MEDIA_BASE`)
+  - Mount should be writable if you want chapter changes written back to source files.
 
 
 ### 4. Run
@@ -66,6 +74,18 @@ docker-compose up -d
 Access the running application in a browser at http://localhost:8000.
 
 </details>
+
+## Local Directory Mode Notes
+
+- Supported local discovery formats in v1: `.m4b` and `.m4a`.
+- Folder handling:
+  - Folders with multiple supported audio files are discovered as one grouped book by default.
+  - You can switch any grouped folder to process files as individual books.
+- Write-back behavior:
+  - Single-file books: chapter metadata is overwritten in-place.
+  - Grouped multi-file books: file layout is preserved; one chapter title is written per file in order.
+  - Grouped multi-file write-back requires chapter timestamps to stay aligned with file boundaries (1:1 mapping).
+- Optional backup toggle creates `<filename>.achew.bak` before overwrite.
 
 <details>
 

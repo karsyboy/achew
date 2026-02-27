@@ -4,7 +4,14 @@ import importlib.metadata
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ...core.config import get_configuration_status, is_abs_configured
+from ...core.config import (
+    get_configuration_status,
+    get_source_mode,
+    is_abs_configured,
+    refresh_app_config,
+    save_source_config,
+    SourceConfig,
+)
 from ...models.enums import Step
 from ...services.abs_service import ABSService
 from ...app import AppState, get_app_state
@@ -93,6 +100,7 @@ async def get_app_status():
         result = {
             "has_pipeline": app_state.pipeline is not None,
             "step": app_state.step.value,
+            "source_mode": config_status.get("source_mode"),
             "abs_configured": config_status["abs_configured"],
             "config_status": config_status,
             "version": get_app_version(),
@@ -104,6 +112,8 @@ async def get_app_status():
             result.update(
                 {
                     "item_id": pipeline.item_id,
+                    "pipeline_source_type": getattr(pipeline, "source_type", "abs"),
+                    "pipeline_local_layout": getattr(pipeline, "local_media_layout", None),
                     "total_chapters": len(pipeline.chapters),
                     "selected_chapters": stats["selected"],
                 }
@@ -147,14 +157,52 @@ async def goto_abs_setup():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/goto-source-setup")
+async def goto_source_setup():
+    """Transition to source setup step"""
+    try:
+        app_state: AppState = get_app_state()
+
+        # Force source mode to unset so AppState.step resolves to SOURCE_SETUP
+        # even when ABS mode is selected but not configured.
+        if get_source_mode() != "unset":
+            if not save_source_config(SourceConfig(mode="unset")):
+                raise HTTPException(status_code=500, detail="Failed to reset source mode")
+            refresh_app_config()
+
+        app_state.step = Step.SOURCE_SETUP
+        await app_state.broadcast_step_change(Step.SOURCE_SETUP)
+        return {"message": "Transitioned to source setup", "step": Step.SOURCE_SETUP.value}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to transition to source setup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/goto-local-setup")
+async def goto_local_setup():
+    """Transition to local source setup step"""
+    try:
+        app_state: AppState = get_app_state()
+        app_state.step = Step.LOCAL_SETUP
+        await app_state.broadcast_step_change(Step.LOCAL_SETUP)
+        return {"message": "Transitioned to local setup", "step": Step.LOCAL_SETUP.value}
+    except Exception as e:
+        logger.error(f"Failed to transition to local setup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/goto-llm-setup")
 async def goto_llm_setup():
     """Transition to LLM setup step"""
     try:
         app_state = get_app_state()
 
-        # Check if ABS is configured first
-        if not is_abs_configured():
+        source_mode = get_source_mode()
+
+        # ABS mode requires ABS setup before entering LLM setup.
+        if source_mode == "abs" and not is_abs_configured():
             raise HTTPException(status_code=400, detail="ABS must be configured before accessing LLM setup")
 
         previous_step = None
@@ -226,4 +274,17 @@ async def complete_abs_setup():
         raise
     except Exception as e:
         logger.error(f"Failed to complete ABS setup: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/complete-local-setup")
+async def complete_local_setup():
+    """Complete local setup and transition to LLM setup"""
+    try:
+        app_state = get_app_state()
+        app_state.step = Step.LLM_SETUP
+        await app_state.broadcast_step_change(Step.LLM_SETUP)
+        return {"message": "Local setup completed, proceeding to LLM setup", "step": Step.LLM_SETUP.value}
+    except Exception as e:
+        logger.error(f"Failed to complete local setup: {e}")
         raise HTTPException(status_code=500, detail=str(e))

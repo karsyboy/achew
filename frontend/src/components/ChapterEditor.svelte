@@ -612,7 +612,7 @@
         }
     }
 
-    function playFromEditedTimestamp(chapterId) {
+    async function playFromEditedTimestamp(chapterId) {
         const parsedTimestamp = parseTimestampInput(timestampInputValue);
         if (parsedTimestamp !== null && !timestampValidationError) {
             try {
@@ -620,7 +620,7 @@
                 if ($currentSegmentId === previewId && $isPlaying) {
                     audio.stop();
                 } else {
-                    audio.play(previewId, parsedTimestamp);
+                    await audio.play(previewId, parsedTimestamp);
                 }
             } catch (err) {
                 error = `Failed to play audio: ${err.message}`;

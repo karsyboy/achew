@@ -18,6 +18,12 @@
     let selectedChapters = [];
     let hasEmptyChapters = false;
     let emptyChapterNumbers = [];
+    let createBackup = false;
+    let groupedLayoutError = "";
+    let isLocalSource = false;
+    let isGroupedLocalSource = false;
+    let expectedGroupedFileStarts = [];
+    const GROUPED_BOUNDARY_TOLERANCE_SECONDS = 0.75;
 
     let editorSettings = {
         show_formatted_time: true
@@ -32,6 +38,23 @@
         selectedChapters = $chapters.filter((chapter) => chapter.selected);
     }
 
+    $: isLocalSource = $session.pipelineSourceType === "local";
+    $: isGroupedLocalSource =
+        isLocalSource && $session.localMediaLayout === "multi_file_grouped";
+
+    $: expectedGroupedFileStarts = (() => {
+        if (!isGroupedLocalSource) return [];
+
+        const audioFiles = $session.book?.media?.audioFiles || [];
+        const starts = [];
+        let current = 0;
+        for (const audioFile of audioFiles) {
+            starts.push(current);
+            current += Number(audioFile?.duration || 0);
+        }
+        return starts;
+    })();
+
     $: {
         const emptyChapters = selectedChapters
             .map((chapter, index) => ({chapter, index}))
@@ -41,6 +64,29 @@
             );
         hasEmptyChapters = emptyChapters.length > 0;
         emptyChapterNumbers = emptyChapters.map(({index}) => index + 1);
+    }
+
+    $: {
+        groupedLayoutError = "";
+        if (isGroupedLocalSource && selectedChapters.length > 0) {
+            if (expectedGroupedFileStarts.length !== selectedChapters.length) {
+                groupedLayoutError =
+                    `Grouped folder write requires ${expectedGroupedFileStarts.length} selected chapters ` +
+                    `(one per source file).`;
+            } else {
+                const ordered = [...selectedChapters].sort(
+                    (a, b) => a.timestamp - b.timestamp,
+                );
+                for (let i = 0; i < ordered.length; i += 1) {
+                    const expectedStart = expectedGroupedFileStarts[i];
+                    if (Math.abs(ordered[i].timestamp - expectedStart) > GROUPED_BOUNDARY_TOLERANCE_SECONDS) {
+                        groupedLayoutError =
+                            "Grouped folder write requires chapter timestamps to match original file boundaries.";
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     function isChapterEmpty(chapter) {
@@ -106,14 +152,17 @@
     }
 
     // Submit to Audiobookshelf
-    async function submitToAudiobookshelf() {
+    async function submitChapters() {
         if (selectedChapters.length === 0) return;
 
         loading = true;
         error = null;
 
         try {
-            await api.session.submit();
+            const submitOptions = isLocalSource
+                ? {create_backup: createBackup === true}
+                : {};
+            await api.session.submit(submitOptions);
             // Session manager will handle the progress updates via WebSocket
         } catch (err) {
             error = handleApiError(err);
@@ -159,6 +208,8 @@
     // Ensure chapters are loaded when arriving at reviewing step
     onMount(async () => {
         try {
+            // Always reset backup toggle when entering review.
+            createBackup = false;
             await loadEditorSettings();
             
             if (
@@ -176,7 +227,13 @@
 <div class="chapter-review">
     <div class="header">
         <h2>Review Final Chapters</h2>
-        <p>Review your final chapter list before submitting to Audiobookshelf</p>
+        <p>
+            {#if isLocalSource}
+                Review your final chapter list before writing changes to local files.
+            {:else}
+                Review your final chapter list before submitting to Audiobookshelf.
+            {/if}
+        </p>
     </div>
 
     <div class="summary-card">
@@ -283,6 +340,23 @@
         </div>
     {/if}
 
+    {#if isLocalSource}
+        <div class="local-submit-options">
+            <label class="backup-option">
+                <input type="checkbox" bind:checked={createBackup} disabled={loading}/>
+                Create backup before overwrite (`.achew.bak`)
+            </label>
+            {#if isGroupedLocalSource}
+                <p class="local-mode-note">
+                    Grouped folder mode writes one title per file in order and requires timestamps to match file starts.
+                </p>
+            {/if}
+            {#if groupedLayoutError}
+                <p class="grouped-layout-error">{groupedLayoutError} Fix chapter selection/timestamps, then try again.</p>
+            {/if}
+        </div>
+    {/if}
+
     {#if error}
         <div class="alert alert-danger">
             {error}
@@ -308,15 +382,19 @@
 
         <button
                 class="btn btn-verify btn-lg"
-                on:click={submitToAudiobookshelf}
-                disabled={selectedChapters.length === 0 || loading || hasEmptyChapters}
+                on:click={submitChapters}
+                disabled={selectedChapters.length === 0 || loading || hasEmptyChapters || !!groupedLayoutError}
         >
             {#if loading}
                 <span class="btn-spinner"></span>
-                Submitting...
+                {isLocalSource ? "Writing..." : "Submitting..."}
             {:else}
                 <Upload size="16"/>
-                Submit to Audiobookshelf
+                {#if isLocalSource}
+                    {isGroupedLocalSource ? "Write Titles to Files" : "Write Chapters to File"}
+                {:else}
+                    Submit to Audiobookshelf
+                {/if}
             {/if}
         </button>
     </div>
@@ -583,6 +661,34 @@
 
     .actions .btn {
         min-width: 200px;
+    }
+
+    .local-submit-options {
+        margin-bottom: 1.25rem;
+        padding: 0.9rem 1rem;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--bg-card) 92%, transparent);
+    }
+
+    .backup-option {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.9rem;
+        color: var(--text-primary);
+    }
+
+    .local-mode-note {
+        margin: 0.6rem 0 0 0;
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+    }
+
+    .grouped-layout-error {
+        margin: 0.5rem 0 0 0;
+        font-size: 0.85rem;
+        color: var(--danger);
     }
 
     .export-section {
