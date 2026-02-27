@@ -10,6 +10,7 @@ from ...core.config import get_configuration_status
 from ...models.abs import Book
 from ...models.enums import RestartStep, Step
 from ...app import get_app_state
+from ...services.local_completion_service import LocalCompletionService
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,14 @@ async def submit_chapters(request: Optional[SubmitPipelineRequest] = None):
         success = await pipeline.submit_chapters(pipeline.chapters, create_backup=submit_request.create_backup)
 
         if success:
+            if pipeline.source_type == "local":
+                try:
+                    marked = LocalCompletionService.mark_pipeline_completed(pipeline)
+                    if not marked:
+                        logger.warning("Local completion tracking was not updated for this submission")
+                except Exception as completion_error:
+                    logger.warning(f"Failed to update local completion tracking: {completion_error}", exc_info=True)
+
             # Completed pipelines no longer need temporary processing files.
             pipeline.cleanup_all_files()
             pipeline.step = Step.COMPLETED

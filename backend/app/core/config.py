@@ -3,7 +3,7 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
@@ -35,6 +35,13 @@ class LocalConfig(BaseModel):
     root_path: str = ""
     validated: bool = False
     last_validated: Optional[datetime] = None
+
+
+class LocalCompletionConfig(BaseModel):
+    """Persistent completion tracking for local files/folders."""
+
+    completed_files: Dict[str, datetime] = Field(default_factory=dict)
+    completed_folders: Dict[str, datetime] = Field(default_factory=dict)
 
 
 class LLMProviderConfig(BaseModel):
@@ -113,6 +120,7 @@ class AppConfig(BaseModel):
     source: SourceConfig = SourceConfig()
     abs: ABSConfig = ABSConfig()
     local: LocalConfig = LocalConfig()
+    local_completion: LocalCompletionConfig = LocalCompletionConfig()
     llm: LLMConfig = LLMConfig()
     user_preferences: UserPreferences = UserPreferences()
     asr_options: ASROptions = ASROptions()
@@ -166,6 +174,7 @@ def load_config() -> AppConfig:
             source_data = db.get("source", {})
             abs_data = db.get("abs", {})
             local_data = db.get("local", {})
+            local_completion_data = db.get("local_completion", {})
             llm_data = db.get("llm", {})
             user_prefs_data = db.get("user_preferences", {})
             asr_options_data = db.get("asr_options", {})
@@ -175,6 +184,9 @@ def load_config() -> AppConfig:
             source_config = SourceConfig(**source_data) if source_data else SourceConfig()
             abs_config = ABSConfig(**abs_data) if abs_data else ABSConfig()
             local_config = LocalConfig(**local_data) if local_data else LocalConfig()
+            local_completion_config = (
+                LocalCompletionConfig(**local_completion_data) if local_completion_data else LocalCompletionConfig()
+            )
             llm_config = LLMConfig(**llm_data) if llm_data else LLMConfig()
             user_prefs = UserPreferences(**user_prefs_data) if user_prefs_data else UserPreferences()
             asr_options = ASROptions(**asr_options_data) if asr_options_data else ASROptions()
@@ -188,6 +200,7 @@ def load_config() -> AppConfig:
                 source=source_config,
                 abs=abs_config,
                 local=local_config,
+                local_completion=local_completion_config,
                 llm=llm_config,
                 user_preferences=user_prefs,
                 asr_options=asr_options,
@@ -208,6 +221,7 @@ def save_config(config: AppConfig) -> bool:
             db["source"] = config.source.model_dump()
             db["abs"] = config.abs.model_dump()
             db["local"] = config.local.model_dump()
+            db["local_completion"] = config.local_completion.model_dump()
             db["llm"] = config.llm.model_dump()
             db["user_preferences"] = config.user_preferences.model_dump()
             db["asr_options"] = config.asr_options.model_dump()
@@ -249,6 +263,17 @@ def save_local_config(local_config: LocalConfig) -> bool:
         return save_config(config)
     except Exception as e:
         logger.error(f"Failed to save local configuration: {e}")
+        return False
+
+
+def save_local_completion_config(local_completion: LocalCompletionConfig) -> bool:
+    """Save only local completion tracking section."""
+    try:
+        config = load_config()
+        config.local_completion = local_completion
+        return save_config(config)
+    except Exception as e:
+        logger.error(f"Failed to save local completion tracking: {e}")
         return False
 
 
@@ -391,6 +416,42 @@ def get_source_mode() -> str:
     """Get the current configured source mode"""
     config = get_app_config()
     return config.source.mode
+
+
+def get_local_completion_config() -> LocalCompletionConfig:
+    """Get local completion tracking state."""
+    config = get_app_config()
+    return config.local_completion
+
+
+def mark_local_completion(
+    *,
+    file_paths: Optional[List[str]] = None,
+    folder_paths: Optional[List[str]] = None,
+    completed_at: Optional[datetime] = None,
+) -> bool:
+    """Mark local files/folders as completed."""
+    try:
+        config = load_config()
+        completion = config.local_completion
+        timestamp = completed_at or datetime.now(timezone.utc)
+
+        for rel_path in file_paths or []:
+            if rel_path:
+                completion.completed_files[rel_path] = timestamp
+
+        for rel_path in folder_paths or []:
+            if rel_path:
+                completion.completed_folders[rel_path] = timestamp
+
+        config.local_completion = completion
+        saved = save_config(config)
+        if saved:
+            refresh_app_config()
+        return saved
+    except Exception as e:
+        logger.error(f"Failed to mark local completion: {e}")
+        return False
 
 
 def get_effective_local_root() -> Optional[str]:

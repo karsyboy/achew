@@ -72,10 +72,24 @@
             grouped.get(parentPath).push(item);
         }
         localStandaloneGroups = Array.from(grouped.entries())
-            .map(([parentPath, files]) => ({
-                parentPath,
-                files: files.sort((a, b) => a.rel_path.localeCompare(b.rel_path)),
-            }))
+            .map(([parentPath, files]) => {
+                const sortedFiles = files.sort((a, b) => a.rel_path.localeCompare(b.rel_path));
+                const allCompleted = sortedFiles.length > 0 && sortedFiles.every((file) => file.completed);
+                let latestCompletedMs = 0;
+                for (const file of sortedFiles) {
+                    if (!file.completed_at) continue;
+                    const parsed = Date.parse(file.completed_at);
+                    if (!Number.isNaN(parsed) && parsed > latestCompletedMs) {
+                        latestCompletedMs = parsed;
+                    }
+                }
+                return {
+                    parentPath,
+                    files: sortedFiles,
+                    completed: allCompleted,
+                    completed_at: latestCompletedMs > 0 ? new Date(latestCompletedMs).toISOString() : null,
+                };
+            })
             .sort((a, b) => {
                 const aIsRoot = a.parentPath === ".";
                 const bIsRoot = b.parentPath === ".";
@@ -98,6 +112,13 @@
             return `${hours}h ${minutes}m ${secs}s`;
         }
         return `${minutes}m ${secs}s`;
+    }
+
+    function formatCompletionTimestamp(value) {
+        if (!value) return "";
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return "";
+        return parsed.toLocaleString();
     }
 
     // Reactive validation with debounce for API calls
@@ -458,6 +479,23 @@
         }
     }
 
+    async function handleNewAudiobook() {
+        try {
+            await session.deleteSession();
+        } catch (error) {
+            console.error("Failed to clear current session:", error);
+        }
+
+        clearAllState();
+        inputMode = "search";
+
+        if ($session.sourceMode === "local") {
+            await loadLocalItems();
+        } else {
+            await loadLibraries();
+        }
+    }
+
     // Load libraries on component mount if starting in search mode
     import {onMount} from "svelte";
 
@@ -498,11 +536,7 @@
                 <div class="actions">
                     <button
                             class="btn btn-verify"
-                            on:click={() => {
-              session.deleteSession();
-              clearAllState();
-              inputMode = "search";
-            }}
+                            on:click={handleNewAudiobook}
                     >
                         New Audiobook
                     </button>
@@ -581,7 +615,14 @@
                                                     <span class="local-chevron">
                                                         <ChevronDown size="16"/>
                                                     </span>
-                                                    <span class="local-title">{item.name}</span>
+                                                    <span class="local-title-row">
+                                                        <span class="local-title">{item.name}</span>
+                                                        {#if item.completed}
+                                                            <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(item.completed_at)}`}>
+                                                                Completed
+                                                            </span>
+                                                        {/if}
+                                                    </span>
                                                 </div>
                                                 <div class="search-result-actions">
                                                     <button
@@ -610,7 +651,14 @@
                                                 {#each item.individual_items as splitItem (splitItem.id)}
                                                     <div class="local-split-row">
                                                         <div>
-                                                            <div class="local-split-title">{splitItem.name}</div>
+                                                            <div class="local-split-title-row">
+                                                                <div class="local-split-title">{splitItem.name}</div>
+                                                                {#if splitItem.completed}
+                                                                    <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(splitItem.completed_at)}`}>
+                                                                        Completed
+                                                                    </span>
+                                                                {/if}
+                                                            </div>
                                                             <div class="local-split-subtitle">{splitItem.rel_path}</div>
                                                         </div>
                                                         <button
@@ -646,7 +694,14 @@
                                                 <span class="local-chevron">
                                                     <ChevronDown size="16"/>
                                                 </span>
-                                                <span class="local-title">{group.parentPath === "." ? "/" : group.parentPath}</span>
+                                                <span class="local-title-row">
+                                                    <span class="local-title">{group.parentPath === "." ? "/" : group.parentPath}</span>
+                                                    {#if group.completed}
+                                                        <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(group.completed_at)}`}>
+                                                            Completed
+                                                        </span>
+                                                    {/if}
+                                                </span>
                                             </summary>
                                             <div class="local-subtitle">
                                                 Standalone files in this folder
@@ -655,7 +710,14 @@
                                                 {#each group.files as item (item.id)}
                                                     <div class="local-split-row">
                                                         <div>
-                                                            <div class="local-split-title">{item.name}</div>
+                                                            <div class="local-split-title-row">
+                                                                <div class="local-split-title">{item.name}</div>
+                                                                {#if item.completed}
+                                                                    <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(item.completed_at)}`}>
+                                                                        Completed
+                                                                    </span>
+                                                                {/if}
+                                                            </div>
                                                             <div class="local-split-subtitle">{item.rel_path}</div>
                                                             <div class="local-meta">{formatDuration(item.duration || 0)}</div>
                                                         </div>
@@ -1428,6 +1490,28 @@
         color: var(--text-primary);
     }
 
+    .local-title-row {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        min-width: 0;
+        flex-wrap: wrap;
+    }
+
+    .local-complete-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.1rem 0.45rem;
+        border-radius: 999px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        line-height: 1.2;
+        color: var(--success);
+        border: 1px solid color-mix(in srgb, var(--success) 40%, transparent);
+        background: color-mix(in srgb, var(--success) 14%, transparent);
+        white-space: nowrap;
+    }
+
     .local-subtitle {
         font-size: 0.82rem;
         color: var(--text-secondary);
@@ -1463,6 +1547,13 @@
     .local-split-title {
         font-size: 0.9rem;
         color: var(--text-primary);
+    }
+
+    .local-split-title-row {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        flex-wrap: wrap;
     }
 
     .local-split-subtitle {

@@ -1,4 +1,5 @@
-from typing import List, Literal
+from datetime import datetime
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +17,8 @@ class LocalSplitItem(BaseModel):
     rel_path: str
     file_count: int = 1
     duration: float = 0.0
+    completed: bool = False
+    completed_at: Optional[datetime] = None
 
 
 class LocalLibraryItem(BaseModel):
@@ -29,3 +32,5 @@ class LocalLibraryItem(BaseModel):
     files: List[LocalAudioFileInfo] = Field(default_factory=list)
     can_split: bool = False
     individual_items: List[LocalSplitItem] = Field(default_factory=list)
+    completed: bool = False
+    completed_at: Optional[datetime] = None

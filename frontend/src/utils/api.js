@@ -533,7 +533,9 @@ export const audiobookshelf = {
 // Local source API
 export const local = {
     async getItems() {
-        return apiRequest('/local/items');
+        return apiRequest('/local/items', {
+            cache: 'no-store',
+        });
     },
 };
 
