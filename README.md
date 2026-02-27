@@ -57,7 +57,10 @@ https://github.com/user-attachments/assets/cde5b668-2849-4fe5-88b7-db0f97d73019
 
 ### 3. Set Up the Compose File
 - Download the [docker-compose.yml](docker-compose.yml) file. This can go anywhere (e.g. inside a new directory named `achew` in your home directory).
-- Change the port and volume mappings if desired.
+- Copy `.env.example` to `.env` and update values for your system:
+  - `ACHEW_MEDIA_DIR` should point to your audiobook library folder on the host.
+  - `ACHEW_CONFIG_DIR` and `ACHEW_HF_CACHE_DIR` should point to persistent host folders.
+  - `ACHEW_PORT` can be changed if `8000` is already in use.
 - If you plan to use Local Directory mode, set the audiobook library bind mount:
   - Host path: your audiobook folder
   - Container path: `/media` (or your configured `LOCAL_MEDIA_BASE`)
@@ -67,7 +70,7 @@ https://github.com/user-attachments/assets/cde5b668-2849-4fe5-88b7-db0f97d73019
 ### 4. Run
 In a terminal, cd into the directory where you downloaded the docker-compose.yml file, and run the following command:
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 ### 5. Access

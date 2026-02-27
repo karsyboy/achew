@@ -4,6 +4,7 @@ frontend/dist/
 
 # Environments
 .venv
+.env
 
 # Python
 __pycache__/
