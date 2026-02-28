@@ -4,11 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "achew"
-version = "1.5.4"
+version = "2.0.1"
 description = "Audiobook Chapter Extraction Wizard"
 license = {text = "MIT"}
 authors = [
     {name = "Sir Gibblets"},
+    {name = "Karsyboy"},
+    {name = "Codex"},
 ]
 requires-python = ">=3.10, <3.14"
 dependencies = [
