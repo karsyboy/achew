@@ -157,6 +157,8 @@ class AIService(ABC):
         infer_end_credits: bool = True,
         preferred_titles: List[str] = None,
         additional_instructions: List[str] = None,
+        book_title: Optional[str] = None,
+        source_files: List[str] = None,
     ) -> str:
         """Build the system prompt dynamically based on options"""
 
@@ -200,6 +202,14 @@ Rules for processing chapter titles:
     - If it appears in the middle of the list and doesn't seem to be a chapter/section/etc or other book division point (i.e. it appears to be narrative content), consider removing it entirely.
     - When removing a chapter, simply set the title to null instead of a string. Keep the index and do not remove the object from the list."""
 
+        if book_title or source_files:
+            base_prompt += "\n\nAudiobook context for interpreting ambiguous titles and custom instructions:"
+            if book_title:
+                base_prompt += f"\n- Audiobook title: {book_title}"
+            if source_files:
+                base_prompt += "\n- Source files:"
+                base_prompt += "\n".join(f"\n  - {source_file}" for source_file in source_files)
+
         if preferred_titles:
             base_prompt += "\n\nThe following is a list of known correct chapter titles for this book. Please attempt to use these where possible. Note that the list may be incomplete:\n"
             base_prompt += "\n".join(preferred_titles)
@@ -221,6 +231,8 @@ Rules for processing chapter titles:
         infer_opening_credits: bool = True,
         infer_end_credits: bool = True,
         preferred_titles: List[str] = None,
+        book_title: Optional[str] = None,
+        source_files: List[str] = None,
     ) -> List[Optional[str]]:
         """Process transcriptions into chapter titles using the LLM"""
         pass

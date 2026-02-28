@@ -1,5 +1,8 @@
 <script>
-    import {onMount} from "svelte";
+    import {onDestroy, onMount} from "svelte";
+    import {
+        queueAutomation,
+    } from "../stores/queueAutomation.js";
     import {session} from "../stores/session.js";
     import {api} from "../utils/api.js";
 
@@ -27,6 +30,7 @@
     let includeUnalignedSources = {};
     let showTooltip = false;
     let showSensitivityTooltip = false;
+    let autoAdvanceTimer = null;
 
     let timelineTooltip = {
         show: false,
@@ -67,6 +71,13 @@
 
     onMount(async () => {
         await loadCueSets();
+    });
+
+    onDestroy(() => {
+        if (autoAdvanceTimer) {
+            clearTimeout(autoAdvanceTimer);
+            autoAdvanceTimer = null;
+        }
     });
 
     $: isComparing = activeComparisonSource !== null;
@@ -252,6 +263,27 @@
 
     $: hasAdditionalTimestamps = Object.values(includeUnalignedSources).some(v => v === true);
     $: totalChapterCount = selectedTimestamps.length + additionalTimestampCount;
+
+    $: {
+        if (autoAdvanceTimer) {
+            clearTimeout(autoAdvanceTimer);
+            autoAdvanceTimer = null;
+        }
+
+        if (
+            $queueAutomation.active &&
+            $session.step === "cue_set_selection" &&
+            !loading &&
+            !error &&
+            selectedTimestamps.length > 0
+        ) {
+            autoAdvanceTimer = setTimeout(() => {
+                if ($queueAutomation.active && $session.step === "cue_set_selection" && !loading) {
+                    proceedWithSelection();
+                }
+            }, $queueAutomation.active_delay_ms);
+        }
+    }
 
     function handleTimelineMouseMove(event) {
         if (!selectedTimestamps || selectedTimestamps.length === 0) return;

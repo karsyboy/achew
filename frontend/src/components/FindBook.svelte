@@ -1,5 +1,14 @@
 <script>
+    import {onMount} from "svelte";
     import {session} from "../stores/session.js";
+    import {
+        buildABSJobKey,
+        buildLocalJobKey,
+        createABSQueueJob,
+        createLocalQueueJob,
+        jobQueue,
+        startNextQueuedJob,
+    } from "../stores/jobQueue.js";
     import {api} from "../utils/api.js";
     import AudiobookCard from "./AudiobookCard.svelte";
     import Icon from "./Icon.svelte";
@@ -53,7 +62,13 @@
     let groupedLocalItems = [];
     let singleLocalItems = [];
     let localStandaloneGroups = [];
+    let selectedLocalJobKeys = [];
     let showCompletedMessage = false;
+    const emptyLocalSelectionState = Object.freeze({
+        selectableCount: 0,
+        selectedCount: 0,
+        allSelected: false,
+    });
 
     $: groupedLocalItems = localItems.filter(
         (item) => item.candidate_type === "multi_file_folder_book",
@@ -119,6 +134,206 @@
         const parsed = new Date(value);
         if (Number.isNaN(parsed.getTime())) return "";
         return parsed.toLocaleString();
+    }
+
+    $: queuedJobKeys = new Set($jobQueue.jobs.map((job) => job.job_key));
+    $: selectedLocalJobKeySet = new Set(selectedLocalJobKeys);
+    $: groupedLocalSelectionStates = new Map(
+        groupedLocalItems.map((item) => [
+            item.id,
+            getLocalSelectionState(
+                item.individual_items,
+                "multi_file_individual",
+                selectedLocalJobKeySet,
+                queuedJobKeys,
+            ),
+        ]),
+    );
+    $: standaloneLocalSelectionStates = new Map(
+        localStandaloneGroups.map((group) => [
+            group.parentPath,
+            getLocalSelectionState(
+                group.files,
+                "single_file",
+                selectedLocalJobKeySet,
+                queuedJobKeys,
+            ),
+        ]),
+    );
+
+    function isJobQueued(jobKey, queuedKeys = queuedJobKeys) {
+        return queuedKeys.has(jobKey);
+    }
+
+    function getLocalJobKey(item, layoutOverride = null) {
+        return buildLocalJobKey(
+            item.id,
+            layoutOverride || item.processing_mode || "single_file",
+        );
+    }
+
+    function clearSelectedLocalJob(jobKey) {
+        if (!selectedLocalJobKeySet.has(jobKey)) {
+            return;
+        }
+
+        const nextSelection = selectedLocalJobKeys.filter((selectedJobKey) => selectedJobKey !== jobKey);
+        selectedLocalJobKeys = nextSelection;
+    }
+
+    function buildABSQueueJobFromBook(book) {
+        const authorName = book?.media?.metadata?.authorName || "";
+
+        return createABSQueueJob({
+            itemId: book?.id,
+            title: book?.media?.metadata?.title || "Unknown title",
+            subtitle: authorName ? `by ${authorName}` : "Audiobookshelf item",
+            duration: book?.duration || 0,
+            coverUrl: book?.media?.coverPath || null,
+            fileCount: book?.media?.audioFiles?.length || book?.media?.numAudioFiles || 0,
+        });
+    }
+
+    function buildValidatedABSQueueJob() {
+        return createABSQueueJob({
+            itemId: itemId.trim(),
+            title: bookInfo?.title || itemId.trim(),
+            subtitle: "Audiobookshelf item",
+            duration: bookInfo?.duration || 0,
+            coverUrl: bookInfo?.coverUrl || null,
+            fileCount: bookInfo?.fileCount || 0,
+        });
+    }
+
+    function buildLocalQueueJobFromItem(item, layoutOverride = null) {
+        const resolvedLayout = layoutOverride || item.processing_mode || "single_file";
+
+        return createLocalQueueJob({
+            localItemId: item.id,
+            localLayout: resolvedLayout,
+            title: item.name,
+            subtitle: item.rel_path,
+            duration: item.duration || 0,
+            fileCount: item.file_count || 1,
+        });
+    }
+
+    function addQueuedJob(job, setError) {
+        const added = jobQueue.addJob(job);
+
+        if (!added) {
+            return false;
+        }
+
+        setError("");
+        return true;
+    }
+
+    function handleQueueValidatedItem() {
+        if (!itemId.trim()) {
+            validationError = "Please enter an item ID";
+            return;
+        }
+
+        if (validationError || !isValidItem || !bookInfo) {
+            return;
+        }
+
+        addQueuedJob(buildValidatedABSQueueJob(), (message) => {
+            validationError = message;
+        });
+    }
+
+    function handleQueueSearchBook(book) {
+        addQueuedJob(buildABSQueueJobFromBook(book), (message) => {
+            searchError = message;
+        });
+    }
+
+    function handleQueueMissingChaptersBook(book) {
+        addQueuedJob(buildABSQueueJobFromBook(book), (message) => {
+            missingChaptersError = message;
+        });
+    }
+
+    function handleQueueLocalItem(item, layoutOverride = null) {
+        const localJobKey = getLocalJobKey(item, layoutOverride);
+        const added = addQueuedJob(buildLocalQueueJobFromItem(item, layoutOverride), (message) => {
+            localError = message;
+        });
+
+        if (added) {
+            clearSelectedLocalJob(localJobKey);
+        }
+    }
+
+    async function handleStartNextQueuedJob() {
+        try {
+            await startNextQueuedJob(session);
+        } catch (error) {
+            console.error("Failed to start queued job:", error);
+        }
+    }
+
+    function getSelectableLocalItems(items, layoutOverride, queuedKeys = queuedJobKeys) {
+        return items.filter((item) => !isJobQueued(getLocalJobKey(item, layoutOverride), queuedKeys));
+    }
+
+    function getLocalSelectionState(
+        items,
+        layoutOverride,
+        selectedKeys = selectedLocalJobKeySet,
+        queuedKeys = queuedJobKeys,
+    ) {
+        const selectableItems = getSelectableLocalItems(items, layoutOverride, queuedKeys);
+        const selectedCount = selectableItems.filter((item) =>
+            selectedKeys.has(getLocalJobKey(item, layoutOverride))).length;
+
+        return {
+            selectableCount: selectableItems.length,
+            selectedCount,
+            allSelected:
+                selectableItems.length > 0 &&
+                selectableItems.every((item) => selectedKeys.has(getLocalJobKey(item, layoutOverride))),
+        };
+    }
+
+    function toggleAllLocalSelections(items, layoutOverride, checked) {
+        const nextSelection = new Set(selectedLocalJobKeys);
+
+        for (const item of getSelectableLocalItems(items, layoutOverride)) {
+            const jobKey = getLocalJobKey(item, layoutOverride);
+            if (checked) {
+                nextSelection.add(jobKey);
+            } else {
+                nextSelection.delete(jobKey);
+            }
+        }
+
+        selectedLocalJobKeys = Array.from(nextSelection);
+    }
+
+    function queueSelectedLocalItems(items, layoutOverride) {
+        const nextSelection = new Set(selectedLocalJobKeys);
+        let addedCount = 0;
+
+        for (const item of items) {
+            const jobKey = getLocalJobKey(item, layoutOverride);
+            if (!nextSelection.has(jobKey) || isJobQueued(jobKey)) {
+                continue;
+            }
+
+            if (jobQueue.addJob(buildLocalQueueJobFromItem(item, layoutOverride))) {
+                addedCount += 1;
+            }
+            nextSelection.delete(jobKey);
+        }
+
+        selectedLocalJobKeys = Array.from(nextSelection);
+
+        if (addedCount > 0) {
+            localError = "";
+        }
     }
 
     // Reactive validation with debounce for API calls
@@ -328,6 +543,7 @@
         localError = "";
         try {
             localItems = await api.local.getItems(refresh);
+            selectedLocalJobKeys = [];
         } catch (error) {
             console.error("Failed to load local items:", error);
             localError = error.message || "Failed to load local items";
@@ -475,6 +691,7 @@
         localItems = [];
         localLoaded = false;
         localError = "";
+        selectedLocalJobKeys = [];
 
         if ($session.sourceMode !== "local") {
             api.audiobookshelf.clearAllCache().catch(console.error);
@@ -497,9 +714,6 @@
             await loadLibraries();
         }
     }
-
-    // Load libraries on component mount if starting in search mode
-    import {onMount} from "svelte";
 
     onMount(() => {
         if ($session.sourceMode !== "local" && inputMode === "search") {
@@ -534,12 +748,34 @@
                     {/if}
                 </p>
                 <div class="actions">
-                    <button
-                            class="btn btn-verify"
-                            on:click={handleNewAudiobook}
-                    >
-                        New Audiobook
-                    </button>
+                    {#if $jobQueue.jobs.length > 0}
+                        <button
+                                class="btn btn-verify"
+                                on:click={handleStartNextQueuedJob}
+                                disabled={$session.loading || $jobQueue.startingJobId}
+                        >
+                            {#if $jobQueue.startingJobId}
+                                <span class="btn-spinner"></span>
+                                Starting...
+                            {:else}
+                                Start Next in Queue
+                            {/if}
+                        </button>
+                        <button
+                                class="btn btn-cancel"
+                                on:click={handleNewAudiobook}
+                                disabled={$session.loading}
+                        >
+                            Back to Library
+                        </button>
+                    {:else}
+                        <button
+                                class="btn btn-verify"
+                                on:click={handleNewAudiobook}
+                        >
+                            New Audiobook
+                        </button>
+                    {/if}
                 </div>
             </div>
         </div>
@@ -627,6 +863,17 @@
                                                 </div>
                                                 <div class="search-result-actions">
                                                     <button
+                                                            class="btn btn-outline queue-btn"
+                                                            on:click|stopPropagation|preventDefault={() => handleQueueLocalItem(item, "multi_file_grouped")}
+                                                            disabled={$session.loading || isValidating || isJobQueued(buildLocalJobKey(item.id, "multi_file_grouped"), queuedJobKeys)}
+                                                    >
+                                                        {#if isJobQueued(buildLocalJobKey(item.id, "multi_file_grouped"), queuedJobKeys)}
+                                                            Queued
+                                                        {:else}
+                                                            Queue
+                                                        {/if}
+                                                    </button>
+                                                    <button
                                                             class="btn btn-verify start-btn"
                                                             on:click|stopPropagation|preventDefault={() => startLocalSession(item, "multi_file_grouped")}
                                                             disabled={$session.loading || isValidating}
@@ -646,34 +893,89 @@
                                                 {item.file_count} files • {formatDuration(item.duration || 0)}
                                             </div>
                                             <div class="local-split-list">
+                                                {#if item.individual_items.length > 0}
+                                                    <div class="local-selection-toolbar">
+                                                        <label class="local-selection-toggle">
+                                                            <input
+                                                                    type="checkbox"
+                                                                    checked={(groupedLocalSelectionStates.get(item.id) || emptyLocalSelectionState).allSelected}
+                                                                    disabled={$session.loading || isValidating || (groupedLocalSelectionStates.get(item.id) || emptyLocalSelectionState).selectableCount === 0}
+                                                                    on:change={(event) =>
+                                                                            toggleAllLocalSelections(
+                                                                                    item.individual_items,
+                                                                                    "multi_file_individual",
+                                                                                    event.currentTarget.checked,
+                                                                            )}
+                                                            />
+                                                            <span>Select all files</span>
+                                                        </label>
+                                                        <button
+                                                                class="btn btn-outline btn-sm"
+                                                                on:click={() => queueSelectedLocalItems(item.individual_items, "multi_file_individual")}
+                                                                disabled={$session.loading || isValidating || (groupedLocalSelectionStates.get(item.id) || emptyLocalSelectionState).selectedCount === 0}
+                                                        >
+                                                            Add Selected to Queue
+                                                            {#if (groupedLocalSelectionStates.get(item.id) || emptyLocalSelectionState).selectedCount > 0}
+                                                                ({(groupedLocalSelectionStates.get(item.id) || emptyLocalSelectionState).selectedCount})
+                                                            {/if}
+                                                        </button>
+                                                    </div>
+                                                {/if}
                                                 <div class="local-split-note">
                                                     Files in folder (start any file to process it as an individual book):
                                                 </div>
                                                 {#each item.individual_items as splitItem (splitItem.id)}
                                                     <div class="local-split-row">
-                                                        <div>
-                                                            <div class="local-split-title-row">
-                                                                <div class="local-split-title">{splitItem.name}</div>
-                                                                {#if splitItem.completed}
-                                                                    <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(splitItem.completed_at)}`}>
-                                                                        Completed
-                                                                    </span>
-                                                                {/if}
+                                                        <div class="local-item-main">
+                                                            <label class="local-item-checkbox">
+                                                                <input
+                                                                        type="checkbox"
+                                                                        value={getLocalJobKey(splitItem, "multi_file_individual")}
+                                                                        bind:group={selectedLocalJobKeys}
+                                                                        disabled={$session.loading || isValidating || isJobQueued(getLocalJobKey(splitItem, "multi_file_individual"), queuedJobKeys)}
+                                                                />
+                                                            </label>
+                                                            <div class="local-item-content">
+                                                                <div class="local-split-title-row">
+                                                                    <div class="local-split-title">{splitItem.name}</div>
+                                                                    {#if splitItem.completed}
+                                                                        <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(splitItem.completed_at)}`}>
+                                                                            Completed
+                                                                        </span>
+                                                                    {/if}
+                                                                </div>
+                                                                <div class="local-split-subtitle">{splitItem.rel_path}</div>
+                                                                <div class="local-meta">{formatDuration(splitItem.duration || 0)}</div>
                                                             </div>
-                                                            <div class="local-split-subtitle">{splitItem.rel_path}</div>
-                                                            <div class="local-meta">{formatDuration(splitItem.duration || 0)}</div>
                                                         </div>
-                                                        <button
-                                                                class="btn btn-cancel btn-sm"
-                                                                on:click={() =>
-                                                                        startLocalSession(
-                                                                                splitItem,
-                                                                                "multi_file_individual",
-                                                                        )}
-                                                                disabled={$session.loading || isValidating}
-                                                        >
-                                                            Start File
-                                                        </button>
+                                                        <div class="local-row-actions">
+                                                            <button
+                                                                    class="btn btn-outline btn-sm"
+                                                                    on:click={() =>
+                                                                            handleQueueLocalItem(
+                                                                                    splitItem,
+                                                                                    "multi_file_individual",
+                                                                            )}
+                                                                    disabled={$session.loading || isValidating || isJobQueued(buildLocalJobKey(splitItem.id, "multi_file_individual"), queuedJobKeys)}
+                                                            >
+                                                                {#if isJobQueued(buildLocalJobKey(splitItem.id, "multi_file_individual"), queuedJobKeys)}
+                                                                    Queued
+                                                                {:else}
+                                                                    Queue
+                                                                {/if}
+                                                            </button>
+                                                            <button
+                                                                    class="btn btn-cancel btn-sm"
+                                                                    on:click={() =>
+                                                                            startLocalSession(
+                                                                                    splitItem,
+                                                                                    "multi_file_individual",
+                                                                            )}
+                                                                    disabled={$session.loading || isValidating}
+                                                            >
+                                                                Start File
+                                                            </button>
+                                                        </div>
                                                     </div>
                                                 {/each}
                                                 {#if item.individual_items.length === 0}
@@ -709,33 +1011,84 @@
                                                 Standalone files in this folder
                                             </div>
                                             <div class="local-split-list">
-                                                {#each group.files as item (item.id)}
-                                                    <div class="local-split-row">
-                                                        <div>
-                                                            <div class="local-split-title-row">
-                                                                <div class="local-split-title">{item.name}</div>
-                                                                {#if item.completed}
-                                                                    <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(item.completed_at)}`}>
-                                                                        Completed
-                                                                    </span>
-                                                                {/if}
-                                                            </div>
-                                                            <div class="local-split-subtitle">{item.rel_path}</div>
-                                                            <div class="local-meta">{formatDuration(item.duration || 0)}</div>
-                                                        </div>
+                                                {#if group.files.length > 0}
+                                                    <div class="local-selection-toolbar">
+                                                        <label class="local-selection-toggle">
+                                                            <input
+                                                                    type="checkbox"
+                                                                    checked={(standaloneLocalSelectionStates.get(group.parentPath) || emptyLocalSelectionState).allSelected}
+                                                                    disabled={$session.loading || isValidating || (standaloneLocalSelectionStates.get(group.parentPath) || emptyLocalSelectionState).selectableCount === 0}
+                                                                    on:change={(event) =>
+                                                                            toggleAllLocalSelections(
+                                                                                    group.files,
+                                                                                    "single_file",
+                                                                                    event.currentTarget.checked,
+                                                                            )}
+                                                            />
+                                                            <span>Select all files</span>
+                                                        </label>
                                                         <button
-                                                                class="btn btn-verify btn-sm"
-                                                                on:click={() => startLocalSession(item, "single_file")}
-                                                                disabled={$session.loading || isValidating}
+                                                                class="btn btn-outline btn-sm"
+                                                                on:click={() => queueSelectedLocalItems(group.files, "single_file")}
+                                                                disabled={$session.loading || isValidating || (standaloneLocalSelectionStates.get(group.parentPath) || emptyLocalSelectionState).selectedCount === 0}
                                                         >
-                                                            {#if $session.loading || isValidating}
-                                                                <span class="btn-spinner"></span>
-                                                                Processing...
-                                                            {:else}
-                                                                Start File
-                                                                <ArrowRight size="14"/>
+                                                            Add Selected to Queue
+                                                            {#if (standaloneLocalSelectionStates.get(group.parentPath) || emptyLocalSelectionState).selectedCount > 0}
+                                                                ({(standaloneLocalSelectionStates.get(group.parentPath) || emptyLocalSelectionState).selectedCount})
                                                             {/if}
                                                         </button>
+                                                    </div>
+                                                {/if}
+                                                {#each group.files as item (item.id)}
+                                                    <div class="local-split-row">
+                                                        <div class="local-item-main">
+                                                            <label class="local-item-checkbox">
+                                                                <input
+                                                                        type="checkbox"
+                                                                        value={getLocalJobKey(item, "single_file")}
+                                                                        bind:group={selectedLocalJobKeys}
+                                                                        disabled={$session.loading || isValidating || isJobQueued(getLocalJobKey(item, "single_file"), queuedJobKeys)}
+                                                                />
+                                                            </label>
+                                                            <div class="local-item-content">
+                                                                <div class="local-split-title-row">
+                                                                    <div class="local-split-title">{item.name}</div>
+                                                                    {#if item.completed}
+                                                                        <span class="local-complete-badge" title={`Completed ${formatCompletionTimestamp(item.completed_at)}`}>
+                                                                            Completed
+                                                                        </span>
+                                                                    {/if}
+                                                                </div>
+                                                                <div class="local-split-subtitle">{item.rel_path}</div>
+                                                                <div class="local-meta">{formatDuration(item.duration || 0)}</div>
+                                                            </div>
+                                                        </div>
+                                                        <div class="local-row-actions">
+                                                            <button
+                                                                    class="btn btn-outline btn-sm"
+                                                                    on:click={() => handleQueueLocalItem(item, "single_file")}
+                                                                    disabled={$session.loading || isValidating || isJobQueued(buildLocalJobKey(item.id, "single_file"), queuedJobKeys)}
+                                                            >
+                                                                {#if isJobQueued(buildLocalJobKey(item.id, "single_file"), queuedJobKeys)}
+                                                                    Queued
+                                                                {:else}
+                                                                    Queue
+                                                                {/if}
+                                                            </button>
+                                                            <button
+                                                                    class="btn btn-verify btn-sm"
+                                                                    on:click={() => startLocalSession(item, "single_file")}
+                                                                    disabled={$session.loading || isValidating}
+                                                            >
+                                                                {#if $session.loading || isValidating}
+                                                                    <span class="btn-spinner"></span>
+                                                                    Processing...
+                                                                {:else}
+                                                                    Start File
+                                                                    <ArrowRight size="14"/>
+                                                                {/if}
+                                                            </button>
+                                                        </div>
                                                     </div>
                                                 {/each}
                                             </div>
@@ -843,6 +1196,18 @@
                             >
                                 <div slot="actions" class="search-result-actions">
                                     <button
+                                            type="button"
+                                            class="btn btn-outline queue-btn"
+                                            disabled={$session.loading || isJobQueued(buildABSJobKey(itemId.trim()), queuedJobKeys)}
+                                            on:click={handleQueueValidatedItem}
+                                    >
+                                        {#if isJobQueued(buildABSJobKey(itemId.trim()), queuedJobKeys)}
+                                            Queued
+                                        {:else}
+                                            Queue
+                                        {/if}
+                                    </button>
+                                    <button
                                             type="submit"
                                             class="btn btn-verify start-btn"
                                             disabled={$session.loading}
@@ -918,6 +1283,17 @@
                                         size="compact"
                                 >
                                     <div slot="actions" class="search-result-actions">
+                                        <button
+                                                class="btn btn-outline queue-btn"
+                                                disabled={$session.loading || isJobQueued(buildABSJobKey(book.id), queuedJobKeys)}
+                                                on:click={() => handleQueueSearchBook(book)}
+                                        >
+                                            {#if isJobQueued(buildABSJobKey(book.id), queuedJobKeys)}
+                                                Queued
+                                            {:else}
+                                                Queue
+                                            {/if}
+                                        </button>
                                         <button
                                                 class="btn btn-verify start-btn"
                                                 disabled={$session.loading}
@@ -1021,6 +1397,17 @@
                                         {book.media.numChapters || 'No'} chapter{book.media.numChapters === 1 ? '' : 's'}
                                     </div>
                                     <div slot="actions" class="search-result-actions">
+                                        <button
+                                                class="btn btn-outline queue-btn"
+                                                disabled={$session.loading || isJobQueued(buildABSJobKey(book.id), queuedJobKeys)}
+                                                on:click={() => handleQueueMissingChaptersBook(book)}
+                                        >
+                                            {#if isJobQueued(buildABSJobKey(book.id), queuedJobKeys)}
+                                                Queued
+                                            {:else}
+                                                Queue
+                                            {/if}
+                                        </button>
                                         <button
                                                 class="btn btn-verify start-btn"
                                                 disabled={$session.loading}
@@ -1241,6 +1628,10 @@
         min-width: 100px;
     }
 
+    .queue-btn {
+        min-width: 84px;
+    }
+
     /* Loading states for input field */
     .form-control.is-debouncing {
         border-color: var(--text-muted);
@@ -1387,6 +1778,9 @@
 
     .search-result-actions {
         flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
     }
 
     .local-header {
@@ -1539,23 +1933,78 @@
         color: var(--text-secondary);
     }
 
-    .local-split-row {
+    .local-selection-toolbar {
         display: flex;
         justify-content: space-between;
         align-items: center;
+        gap: 0.75rem;
+        padding-bottom: 0.25rem;
+        border-bottom: 1px dashed color-mix(in srgb, var(--border-color) 75%, transparent);
+    }
+
+    .local-selection-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        color: var(--text-primary);
+        font-size: 0.85rem;
+        font-weight: 500;
+    }
+
+    .local-item-checkbox {
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        margin: 0;
+        padding-top: 0.15rem;
+        flex-shrink: 0;
+    }
+
+    .local-item-checkbox input,
+    .local-selection-toggle input {
+        width: 1rem;
+        height: 1rem;
+        accent-color: var(--primary);
+    }
+
+    .local-split-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
         gap: 1rem;
+        align-items: flex-start;
+    }
+
+    .local-item-main {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 0.65rem;
+        min-width: 0;
+    }
+
+    .local-item-content {
+        min-width: 0;
+    }
+
+    .local-row-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-shrink: 0;
     }
 
     .local-split-title {
         font-size: 0.9rem;
         color: var(--text-primary);
+        min-width: 0;
+        word-break: break-word;
     }
 
     .local-split-title-row {
-        display: inline-flex;
-        align-items: center;
+        display: flex;
+        align-items: flex-start;
         gap: 0.45rem;
         flex-wrap: wrap;
+        min-width: 0;
     }
 
     .local-split-subtitle {
@@ -1627,10 +2076,28 @@
             min-width: auto;
         }
 
-        .local-card-main,
-        .local-split-row {
+        .local-card-main {
             flex-direction: column;
             align-items: stretch;
+        }
+
+        .local-split-row {
+            grid-template-columns: 1fr;
+        }
+
+        .local-selection-toolbar {
+            flex-direction: column;
+            align-items: stretch;
+        }
+
+        .search-result-actions,
+        .local-row-actions {
+            width: 100%;
+        }
+
+        .search-result-actions > *,
+        .local-row-actions > * {
+            flex: 1;
         }
 
         .local-actions {

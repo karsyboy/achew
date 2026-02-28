@@ -2,6 +2,9 @@
     import {onDestroy, onMount} from "svelte";
     import {audio, currentSegmentId, isPlaying} from "../stores/audio.js";
     import {
+        queueAutomation,
+    } from "../stores/queueAutomation.js";
+    import {
         canRedo,
         canUndo,
         chapters,
@@ -39,6 +42,7 @@
     let showAddChapterDialog = $state(false);
     let addChapterDialogChapterId = $state(null);
     let addChapterDialogDefaultTab = $state(null);
+    let autoAdvanceTimer = null;
 
     let showSettings = $state(false);
     let editorSettings = $state({
@@ -84,6 +88,9 @@
     onDestroy(() => {
         audio.stop();
         window.removeEventListener("keydown", handleKeydown);
+        if (autoAdvanceTimer) {
+            clearTimeout(autoAdvanceTimer);
+        }
     });
 
     // Resize all text areas after updates (for programmatic value changes)
@@ -431,6 +438,22 @@
         }
     }
 
+    async function runQueuedAICleanup() {
+        if ($selectionStats.selected === 0 || loading) return;
+
+        loading = true;
+        try {
+            const aiOptions = await api.batch.getAIOptions();
+            queueAutomation.markAICleanupDone();
+            await api.batch.processSelected(aiOptions);
+        } catch (err) {
+            queueAutomation.stop("ai_cleanup_failed");
+            error = handleApiError(err);
+        } finally {
+            loading = false;
+        }
+    }
+
     function handleAICleanupCancel() {
         showAIConfirmation = false;
     }
@@ -487,6 +510,40 @@
                 error = handleApiError(err);
             });
     }
+
+    $effect(() => {
+        if ($queueAutomation.active && aiCleanupError) {
+            queueAutomation.stop("ai_cleanup_failed");
+        }
+    });
+
+    $effect(() => {
+        if (autoAdvanceTimer) {
+            clearTimeout(autoAdvanceTimer);
+            autoAdvanceTimer = null;
+        }
+
+        if (
+            $queueAutomation.active &&
+            $session.step === "chapter_editing" &&
+            !loading &&
+            !error &&
+            !aiCleanupError &&
+            !showAIConfirmation &&
+            !showAddChapterDialog &&
+            $chapters.length > 0
+        ) {
+            autoAdvanceTimer = setTimeout(() => {
+                if ($queueAutomation.active && $session.step === "chapter_editing" && !loading) {
+                    if ($queueAutomation.ai_cleanup_done) {
+                        goToReview();
+                    } else {
+                        runQueuedAICleanup();
+                    }
+                }
+            }, $queueAutomation.active_delay_ms);
+        }
+    });
 
     // Timestamp editing functions
     function startTimestampEdit(chapterId, currentTimestamp) {

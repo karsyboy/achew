@@ -658,6 +658,40 @@ class ProcessingPipeline:
             media=media,
         )
 
+    @staticmethod
+    def _sanitize_ai_prompt_value(value: Optional[str]) -> str:
+        if not value:
+            return ""
+
+        return " ".join(str(value).split())
+
+    def _build_ai_cleanup_prompt_context(self) -> Tuple[str, List[str]]:
+        book_title = ""
+        source_files: List[str] = []
+        seen_files = set()
+
+        if self.book and self.book.media and self.book.media.metadata:
+            book_title = self._sanitize_ai_prompt_value(self.book.media.metadata.title)
+
+        if self.book and self.book.media and self.book.media.audioFiles:
+            for audio_file in self.book.media.audioFiles:
+                metadata = audio_file.metadata
+                candidates = [
+                    getattr(metadata, "relPath", ""),
+                    getattr(metadata, "filename", ""),
+                ]
+
+                for candidate in candidates:
+                    normalized_candidate = self._sanitize_ai_prompt_value(candidate)
+                    if not normalized_candidate or normalized_candidate in seen_files:
+                        continue
+
+                    seen_files.add(normalized_candidate)
+                    source_files.append(normalized_candidate)
+                    break
+
+        return book_title, source_files
+
     async def fetch_item(self, item_id: Optional[str] = None) -> Dict[str, Any]:
         """Fetch and prepare the selected source item for processing."""
         if self.source_type == "local":
@@ -1867,6 +1901,8 @@ class ProcessingPipeline:
             if additional_instructions.strip():
                 instructions_list.append(additional_instructions.strip())
 
+            book_title, source_files = self._build_ai_cleanup_prompt_context()
+
             # Use the main processing method with selected model
             try:
                 processed_titles = await ai_provider.process_chapter_titles(
@@ -1877,6 +1913,8 @@ class ProcessingPipeline:
                     infer_opening_credits=infer_opening_credits,
                     infer_end_credits=infer_end_credits,
                     preferred_titles=preferred_titles,
+                    book_title=book_title,
+                    source_files=source_files,
                 )
             except Exception as e:
                 logger.error(f"AI cleanup failed, no changes made to chapters: {e}")

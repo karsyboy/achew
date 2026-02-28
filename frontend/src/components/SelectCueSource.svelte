@@ -1,6 +1,9 @@
 <script>
-    import {onMount} from "svelte";
+    import {onDestroy, onMount} from "svelte";
     import {slide} from "svelte/transition";
+    import {
+        queueAutomation,
+    } from "../stores/queueAutomation.js";
     import {session} from "../stores/session.js";
     import {api} from "../utils/api.js";
     import AudiobookCard from "./AudiobookCard.svelte";
@@ -32,6 +35,7 @@
     let settingsExpanded = false;
     let debounceTimeout = null;
     let localConfig = {...$session.smartDetectConfig};
+    let autoAdvanceTimer = null;
 
     // Get cue sources from session data
     $: if ($session.cueSources) {
@@ -219,6 +223,13 @@
         chapterModalTitle = "";
     }
 
+    function clearAutoAdvanceTimer() {
+        if (autoAdvanceTimer) {
+            clearTimeout(autoAdvanceTimer);
+            autoAdvanceTimer = null;
+        }
+    }
+
 
 
     // Get the option display info
@@ -246,6 +257,25 @@
             await session.loadSmartDetectConfig();
         }
     });
+
+    onDestroy(() => {
+        clearAutoAdvanceTimer();
+        if (debounceTimeout) {
+            clearTimeout(debounceTimeout);
+        }
+    });
+
+    $: {
+        clearAutoAdvanceTimer();
+
+        if ($queueAutomation.active && $session.step === "select_cue_source" && !loading && !error) {
+            autoAdvanceTimer = setTimeout(() => {
+                if ($queueAutomation.active && $session.step === "select_cue_source" && !loading) {
+                    proceedWithSelection();
+                }
+            }, $queueAutomation.active_delay_ms);
+        }
+    }
 </script>
 
 <div class="chapter-options">

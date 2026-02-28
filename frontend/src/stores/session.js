@@ -287,7 +287,7 @@ function createSessionStore() {
                         asr_buffer: 0.25,
                     },
                     smartDetectConfigLoading: false,
-                    version: null,
+                    version: currentState.version || null,
                     loading: false,
                     error: null
                 });
@@ -327,7 +327,7 @@ function createSessionStore() {
                     asr_buffer: 0.25,
                 },
                 smartDetectConfigLoading: false,
-                version: null,
+                version: currentState.version || null,
                 loading: false,
                 error: null
             });

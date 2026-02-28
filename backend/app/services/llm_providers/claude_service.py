@@ -258,6 +258,8 @@ class ClaudeService(AIService):
         infer_opening_credits: bool = True,
         infer_end_credits: bool = True,
         preferred_titles: List[str] = None,
+        book_title: Optional[str] = None,
+        source_files: List[str] = None,
     ) -> List[Optional[str]]:
         """Process transcriptions into chapter titles using Claude"""
 
@@ -276,6 +278,8 @@ class ClaudeService(AIService):
             infer_end_credits=infer_end_credits,
             preferred_titles=preferred_titles,
             additional_instructions=additional_instructions,
+            book_title=book_title,
+            source_files=source_files,
         )
 
         # Create JSON input for all chapters

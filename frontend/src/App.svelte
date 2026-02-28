@@ -1,6 +1,8 @@
 <script>
     import {onDestroy, onMount} from "svelte";
     import {session} from "./stores/session.js";
+    import {queueAutomation} from "./stores/queueAutomation.js";
+    import {jobQueue} from "./stores/jobQueue.js";
     import {isConnected, websocket} from "./stores/websocket.js";
 
     // Pages
@@ -13,6 +15,7 @@
     import ConfigureASR from "./components/ConfigureASR.svelte";
     import Connecting from "./components/Connecting.svelte";
     import InitialChapterSelection from "./components/InitialChapterSelection.svelte";
+    import JobQueuePanel from "./components/JobQueuePanel.svelte";
     import FindBook from "./components/FindBook.svelte";
     import Icon from "./components/Icon.svelte";
     import LLMSetup from "./components/LLMSetup.svelte";
@@ -374,9 +377,38 @@
     // Keep settings available in setup flows so source mode can always be switched.
     $: isConnectingView = currentComponent === Connecting;
     $: shouldShowSettings = $session.step !== "source_setup" && !isConnectingView;
+    $: showQueuePanel =
+        !isConnectingView &&
+        !["source_setup", "abs_setup", "local_setup", "llm_setup"].includes($session.step) &&
+        $jobQueue.jobs.length > 0;
+    $: if (
+        $queueAutomation.active &&
+        ["reviewing", "completed", "idle", "source_setup", "abs_setup", "local_setup", "llm_setup"].includes($session.step)
+    ) {
+        queueAutomation.stop($session.step === "reviewing" ? "reviewing" : "inactive");
+    }
 
     $: updateAvailable = isNewerVersion($session.version, latestVersion);
+
+    function handleQueueAutomationInteraction(event) {
+        if (!$queueAutomation.active) {
+            return;
+        }
+
+        if (event?.isTrusted === false) {
+            return;
+        }
+
+        queueAutomation.stopForInteraction();
+    }
 </script>
+
+<svelte:window
+        on:pointerdown={handleQueueAutomationInteraction}
+        on:keydown={handleQueueAutomationInteraction}
+        on:input={handleQueueAutomationInteraction}
+        on:change={handleQueueAutomationInteraction}
+/>
 
 <!-- svelte-ignore a11y-click-events-have-key-events -->
 <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
@@ -502,37 +534,45 @@
         </div>
     </header>
 
-    <div class="app-content">
-        {#if $session.error}
-            <div class="alert alert-danger mb-3 error-message">
-                <strong>Error:</strong>
-                {$session.error}
-                <button
-                        type="button"
-                        class="btn btn-sm btn-outline float-right"
-                        on:click={() => session.clearError()}
-                >
-                    Dismiss
-                </button>
-            </div>
-        {/if}
-
-        {#if mounted}
-            {#if currentComponent === Connecting}
-                <Connecting
-                        message={checkingConfig ? "Checking configuration…" : null}
-                />
-            {:else}
-                <svelte:component
-                        this={currentComponent}
-                        on:abs-configured={handleABSConfigured}
-                        on:llm-setup-complete={handleLLMSetupComplete}
-                />
+    <div class="app-content" class:with-queue={showQueuePanel}>
+        <div class="app-main">
+            {#if $session.error}
+                <div class="alert alert-danger mb-3 error-message">
+                    <strong>Error:</strong>
+                    {$session.error}
+                    <button
+                            type="button"
+                            class="btn btn-sm btn-outline float-right"
+                            on:click={() => session.clearError()}
+                    >
+                        Dismiss
+                    </button>
+                </div>
             {/if}
-        {:else}
-            <div class="text-center p-4">
-                <div class="spinner"></div>
-                <p class="mt-2">Loading...</p>
+
+            {#if mounted}
+                {#if currentComponent === Connecting}
+                    <Connecting
+                            message={checkingConfig ? "Checking configuration…" : null}
+                    />
+                {:else}
+                    <svelte:component
+                            this={currentComponent}
+                            on:abs-configured={handleABSConfigured}
+                            on:llm-setup-complete={handleLLMSetupComplete}
+                    />
+                {/if}
+            {:else}
+                <div class="text-center p-4">
+                    <div class="spinner"></div>
+                    <p class="mt-2">Loading...</p>
+                </div>
+            {/if}
+        </div>
+
+        {#if showQueuePanel}
+            <div class="queue-column">
+                <JobQueuePanel/>
             </div>
         {/if}
     </div>
@@ -760,6 +800,25 @@
         flex-direction: column;
     }
 
+    .app-content.with-queue {
+        max-width: 1440px;
+        flex-direction: row;
+        align-items: flex-start;
+        gap: 2rem;
+    }
+
+    .app-main {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .queue-column {
+        width: min(360px, 100%);
+        flex-shrink: 0;
+    }
+
     .audiobook-info-pill {
         background: linear-gradient(
                 135deg,
@@ -903,6 +962,14 @@
 
         .settings-dropdown {
             max-width: calc(100vw - 1rem);
+        }
+
+        .app-content.with-queue {
+            flex-direction: column;
+        }
+
+        .queue-column {
+            width: 100%;
         }
 
         .audiobook-info-pill {
